@@ -185,9 +185,69 @@ app.get("/", async (req, res) => {
 // })
 
 app.get('/view', async (req, res) => {
-    const entries = await Submission.find();
-    const currentDate = curdate();
-    res.render('reterive', { entries: entries , date : currentDate , username : req.cookies.name , role : req.cookies.role });
+    try {
+        // Get month and year from query params, default to current date
+        const today = new Date();
+        let month = req.query.month ? parseInt(req.query.month) : today.getMonth() + 1;
+        let year = req.query.year ? parseInt(req.query.year) : today.getFullYear();
+
+        // Validate month range
+        if (month < 1) {
+            month = 12;
+            year--;
+        } else if (month > 12) {
+            month = 1;
+            year++;
+        }
+
+        // Calculate start and end dates for the month
+        const startDate = new Date(year, month - 1, 1);
+        const endDate = new Date(year, month, 0);
+
+        const formattedStartDate = formatDateToYMD(startDate);
+        const formattedEndDate = formatDateToYMD(endDate);
+
+        // Get all records and filter by month
+        const allRecords = await Submission.find({});
+        const entries = allRecords.filter(record => {
+            const [day, dbMonth, dbYear] = record.date.split('/');
+            const recordDate = formatDateToYMD(new Date(dbYear, dbMonth - 1, day));
+            return recordDate >= formattedStartDate && recordDate <= formattedEndDate;
+        });
+
+        // Calculate previous and next month
+        const prevMonth = month === 1 ? 12 : month - 1;
+        const prevYear = month === 1 ? year - 1 : year;
+        const nextMonth = month === 12 ? 1 : month + 1;
+        const nextYear = month === 12 ? year + 1 : year;
+
+        // Check if next month is in the future (disable navigation to future months)
+        const nextMonthDate = new Date(nextYear, nextMonth - 1, 1);
+        const canGoToNextMonth = nextMonthDate <= today;
+
+        // Month names for display
+        const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+        const monthDisplay = monthNames[month - 1];
+
+        const currentDate = curdate();
+        res.render('reterive', { 
+            entries: entries, 
+            date: currentDate, 
+            username: req.cookies.name, 
+            role: req.cookies.role,
+            currentMonth: month,
+            currentYear: year,
+            monthDisplay: monthDisplay,
+            prevMonth: prevMonth,
+            prevYear: prevYear,
+            nextMonth: nextMonth,
+            nextYear: nextYear,
+            canGoToNextMonth: canGoToNextMonth
+        });
+    } catch (err) {
+        console.error('Error fetching records:', err);
+        res.status(500).send('Error fetching records');
+    }
 });
 
 app.post('/submit', async (req, res) => {
@@ -623,21 +683,22 @@ app.post('/update/:date', async (req, res) => {
         val.amount = +val.amount;
     });
 
-    const milkRevenue = (+morningMilk + +eveningMilk) * milkPrice;
-
-    const totalExpenses = expensesArray.reduce((sum, expense) => sum + expense.amount, 0);
-    const totalRevenue = revenuesArray.reduce((sum, revenue) => sum + revenue.amount, 0) + milkRevenue;
-    
-    const balance = totalRevenue - totalExpenses;
-    console.log("Balance: ", balance);
-
     try {
         const oldEntry = await Submission.findOne({ date: decodeddate });
+        const currentMilkPrice = oldEntry?.milkPrice ?? milkPrice;
+
+        const milkRevenue = (+morningMilk + +eveningMilk) * currentMilkPrice;
+        const totalExpenses = expensesArray.reduce((sum, expense) => sum + expense.amount, 0);
+        const totalRevenue = revenuesArray.reduce((sum, revenue) => sum + revenue.amount, 0) + milkRevenue;
+        const balance = totalRevenue - totalExpenses;
+        console.log("Balance: ", balance);
+
         const updatedEntry = await Submission.findOneAndUpdate(
             { date: decodeddate },
             {
                 morningMilkQuantity: morningMilk,
                 eveningMilkQuantity: eveningMilk,
+                milkPrice: currentMilkPrice,
                 expenses: expensesArray,
                 revenues: revenuesArray,
                 totalRevenue: totalRevenue,

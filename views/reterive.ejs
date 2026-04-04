@@ -23,6 +23,16 @@
         </ul>
     </nav>
 
+    <div class="month-navigation">
+        <a href="/view?month=<%= prevMonth %>&year=<%= prevYear %>" class="month-arrow">&lt;</a>
+        <h3 class="month-display"><%= monthDisplay %> <%= currentYear %></h3>
+        <% if (canGoToNextMonth) { %>
+            <a href="/view?month=<%= nextMonth %>&year=<%= nextYear %>" class="month-arrow">&gt;</a>
+        <% } else { %>
+            <span class="month-arrow disabled">&gt;</span>
+        <% } %>
+    </div>
+
     <h2>Entries Table</h2>
 
     <% entries.forEach(entry => { %> 

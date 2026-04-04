@@ -129,23 +129,23 @@ app.use(session({
 
 app.use(cookieParser(process.env.SECRET_KEY));
 app.use((req, res, next) => {
-    // Always derive trusted role/name from signed cookies, with JWT as fallback.
-    let trustedRole = req.signedCookies?.role;
-    let trustedName = req.signedCookies?.name;
+    // Derive role/name only from JWT so no separate role/name cookies are needed.
+    let trustedRole = null;
+    let trustedName = null;
 
-    if ((!trustedRole || !trustedName) && req.cookies?.tId) {
+    if (req.cookies?.tId) {
         try {
             const payload = getUser(req.cookies.tId);
-            trustedRole = trustedRole || payload.role;
-            trustedName = trustedName || payload.name;
+            trustedRole = payload?.role || null;
+            trustedName = payload?.name || null;
         } catch (err) {
             trustedRole = null;
             trustedName = null;
         }
     }
 
-    req.cookies.role = trustedRole || null;
-    req.cookies.name = trustedName || null;
+    req.cookies.role = trustedRole;
+    req.cookies.name = trustedName;
     next();
 });
 app.use("/home" , restriction);
@@ -453,8 +453,9 @@ app.post("/login" , async (req,res) => {
         const token = setUser(user);
         const oneMonth = 30 * 24 * 60 * 60 * 1000;
         res.cookie("tId", token, { expires: new Date(Date.now() + oneMonth), httpOnly: true });
-        res.cookie("role", user.role, { expires: new Date(Date.now() + oneMonth), httpOnly: true, signed: true });
-        res.cookie("name", user.name, { expires: new Date(Date.now() + oneMonth), httpOnly: true, signed: true });
+        // Clear legacy cookies if present.
+        res.clearCookie("role");
+        res.clearCookie("name");
 
         res.redirect("/home")
     }else {

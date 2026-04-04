@@ -25,7 +25,7 @@
 
     <h3>Select a Month to View Reports</h3>
     <div>
-        <ul>
+        <ul class="month-grid">
         <% months.forEach(month => { %>
             <li><a href="/getrep/<%= month %>">View Records for <%= month %></a></li>
         <% }) %>

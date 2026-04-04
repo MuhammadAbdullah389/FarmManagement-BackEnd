@@ -1,3 +1,5 @@
+@import url("/styles/theme.css");
+
 /* Global Styles */
 * {
     margin: 0;
@@ -86,7 +88,7 @@ h3 {
 }
 
 /* Grid layout for responsive design */
-div ul {
+.month-grid {
     list-style: none;
     padding: 0;
     margin: 0;
@@ -96,7 +98,7 @@ div ul {
     margin-top: 20px;
 }
 
-div ul li {
+.month-grid li {
     background-color: #34495e;
     padding: 15px;
     border-radius: 8px;
@@ -105,23 +107,23 @@ div ul li {
     transition: transform 0.3s ease, background-color 0.3s ease;
 }
 
-div ul li:hover {
+.month-grid li:hover {
     transform: translateY(-5px);
     background-color: #1abc9c;
 }
 
-div ul li a {
+.month-grid li a {
     color: #fff;
     font-size: 18px;
     text-decoration: none;
     transition: color 0.3s ease;
 }
 
-div ul li a:hover {
+.month-grid li a:hover {
     color: #fff;
 }
 
-div ul li a:focus {
+.month-grid li a:focus {
     outline: none;
     box-shadow: 0 0 5px #1abc9c;
 }
@@ -138,9 +140,9 @@ button {
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
     transition: background-color 0.3s ease, transform 0.3s ease;
     align-self: center;
-    margin-top: 10px; /* Set margin-top to a small value */
-    position: absolute;
-        bottom: 0;
+    margin: 28px auto 10px;
+    display: inline-block;
+    position: static;
 }
 
 /* Button hover effect */
@@ -173,11 +175,11 @@ button:focus {
         gap: 10px;
     }
 
-    div ul {
+    .month-grid {
         grid-template-columns: 1fr; /* Single column on smaller screens */
     }
 
-    div ul li {
+    .month-grid li {
         font-size: 16px;
         padding: 12px;
     }
@@ -214,7 +216,7 @@ button:focus {
         margin : 40px 0 0 0;
     }
 
-    div ul li {
+    .month-grid li {
         font-size: 14px;
         padding: 8px;  /* Smaller padding */
         margin: 0 0 20px 0;

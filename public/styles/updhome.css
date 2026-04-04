@@ -1,3 +1,5 @@
+@import url("/styles/theme.css");
+
 /* Global Styles */
 * {
     margin: 0;
@@ -76,11 +78,16 @@ h2 {
     margin-top: 30px;
 }
 
-div {
+.message-wrap {
     display: flex;
     justify-content: center;
     align-items: center;
-    min-height: 30vh;
+    min-height: 20vh;
+    text-align: center;
+}
+
+.message-wrap h2 {
+    margin-top: 0;
 }
 
 button {
@@ -184,7 +191,7 @@ button:focus {
         padding: 8px;
     }
 
-    div {
+    .message-wrap {
         flex-direction: column;
         min-height: auto;
     }

@@ -1,0 +1,76 @@
+:root {
+    --bg: #162035;
+    --panel: #243654;
+    --panel-2: #2f4668;
+    --text: #edf3ff;
+    --muted: #b7c4de;
+    --primary: #1abc9c;
+    --primary-hover: #16a085;
+    --accent: #f39c12;
+    --danger: #e74c3c;
+    --radius: 12px;
+    --shadow: 0 8px 22px rgba(0, 0, 0, 0.26);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    background: radial-gradient(circle at 15% 10%, #1e2a47 0%, var(--bg) 50%, #0f1728 100%);
+    color: var(--text);
+}
+
+header {
+    background-color: var(--panel);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+
+nav {
+    background-color: var(--panel-2);
+    border-radius: 10px;
+}
+
+nav ul {
+    gap: 12px;
+}
+
+nav ul li a {
+    color: var(--text);
+    text-decoration: none;
+}
+
+nav ul li a:hover {
+    color: var(--primary);
+}
+
+h2,
+h3,
+h4,
+label,
+p,
+li,
+td,
+th {
+    word-wrap: break-word;
+}
+
+button {
+    border-radius: 10px;
+}
+
+@media only screen and (max-width: 768px) {
+    body {
+        padding: 12px;
+    }
+
+    header {
+        padding: 22px;
+    }
+
+    nav ul {
+        flex-direction: column;
+        align-items: center;
+    }
+}

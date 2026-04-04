@@ -85,6 +85,31 @@ function formatToDatabaseMonth(monthName, year) {
     }
 }
 
+function isCurrentMonthDate(ddmmyyyy) {
+    const [day, month, year] = ddmmyyyy.split('/').map(Number);
+    const selected = new Date(year, month - 1, day);
+    const todayParts = curdate().split('/').map(Number);
+    const current = new Date(todayParts[2], todayParts[1] - 1, todayParts[0]);
+
+    return (
+        selected.getMonth() === current.getMonth() &&
+        selected.getFullYear() === current.getFullYear()
+    );
+}
+
+function getCurrentMonthInputRange() {
+    const todayParts = curdate().split('/').map(Number);
+    const year = todayParts[2];
+    const month = todayParts[1];
+    const monthStr = String(month).padStart(2, '0');
+
+    const minDate = `${year}-${monthStr}-01`;
+    const lastDay = new Date(year, month, 0).getDate();
+    const maxDate = `${year}-${monthStr}-${String(lastDay).padStart(2, '0')}`;
+
+    return { minDate, maxDate };
+}
+
 
 
 
@@ -102,7 +127,27 @@ app.use(session({
     cookie: { maxAge: oneMonth } 
 }));
 
-app.use(cookieParser());
+app.use(cookieParser(process.env.SECRET_KEY));
+app.use((req, res, next) => {
+    // Always derive trusted role/name from signed cookies, with JWT as fallback.
+    let trustedRole = req.signedCookies?.role;
+    let trustedName = req.signedCookies?.name;
+
+    if ((!trustedRole || !trustedName) && req.cookies?.tId) {
+        try {
+            const payload = getUser(req.cookies.tId);
+            trustedRole = trustedRole || payload.role;
+            trustedName = trustedName || payload.name;
+        } catch (err) {
+            trustedRole = null;
+            trustedName = null;
+        }
+    }
+
+    req.cookies.role = trustedRole || null;
+    req.cookies.name = trustedName || null;
+    next();
+});
 app.use("/home" , restriction);
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(restrictAll)
@@ -169,19 +214,22 @@ app.post('/submit', async (req, res) => {
     const totalRevenue = revenuesArray.reduce((sum, revenue) => sum + revenue.amount, 0) + milkRevenue;
     const balance = totalRevenue - totalExpenses;
     
-    const currentDate = curdate();
+    const selectedDate = req.body.recordDate;
+    const currentDate = selectedDate || curdate();
 
     const existingSubmission = await Submission.findOne({ date: currentDate });
     console.log(currentDate)
     console.log(existingSubmission);
     if (existingSubmission) {
         console.log("executed")
+        const encodedDate = encodeURIComponent(currentDate);
         // If record already exists, prevent both submission and monthly report insertion
         return res.render("insertedHome", {
             msg: `A record already exists for the date ${currentDate}. Try Updating.`,
             username: req.cookies.name,
             date: currentDate,
-            insertion: false
+            link: encodedDate,
+            insertion: true
         });
     }
 
@@ -345,8 +393,8 @@ app.post("/login" , async (req,res) => {
         const token = setUser(user);
         const oneMonth = 30 * 24 * 60 * 60 * 1000;
         res.cookie("tId", token, { expires: new Date(Date.now() + oneMonth), httpOnly: true });
-        res.cookie("role", user.role, { expires: new Date(Date.now() + oneMonth), httpOnly: true });
-        res.cookie("name", user.name, { expires: new Date(Date.now() + oneMonth), httpOnly: true });
+        res.cookie("role", user.role, { expires: new Date(Date.now() + oneMonth), httpOnly: true, signed: true });
+        res.cookie("name", user.name, { expires: new Date(Date.now() + oneMonth), httpOnly: true, signed: true });
 
         res.redirect("/home")
     }else {
@@ -438,17 +486,104 @@ app.get("/update" , async (req , res) => {
         return res.redirect("/view");
      }else{
     const currentDate = curdate();
+    res.render("updatechoice" , { username : req.cookies.name , date : currentDate , role : req.cookies.role });
+     }
+})
+
+app.get("/update/existing" , async (req , res) => {
+     if ( req.cookies.role === "user" ){
+        return res.redirect("/view");
+     }else{
+    const currentDate = curdate();
     res.render("updaterecord" , { error : null , username : req.cookies.name , date : currentDate , role : req.cookies.role });
      }
+})
+
+app.get("/update/new" , async (req , res) => {
+     if ( req.cookies.role === "user" ){
+        return res.redirect("/view");
+     }
+
+    const { minDate, maxDate } = getCurrentMonthInputRange();
+    res.render("newrecord" , {
+        error : null,
+        username : req.cookies.name,
+        date : curdate(),
+        role : req.cookies.role,
+        minDate,
+        maxDate,
+        selectedDateInput: "",
+        selectedDate: "",
+        showForm: false,
+    });
+})
+
+app.post("/update/new/check-date" , async (req , res) => {
+    const rawDate = req.body.date;
+    const selectedDate = formatDateToPKR(rawDate);
+    const { minDate, maxDate } = getCurrentMonthInputRange();
+
+    if (!isCurrentMonthDate(selectedDate)) {
+        return res.render("newrecord" , {
+            error : "Only current month date is allowed for new record insertion.",
+            username : req.cookies.name,
+            date : curdate(),
+            role : req.cookies.role,
+            minDate,
+            maxDate,
+            selectedDateInput: rawDate,
+            selectedDate: "",
+            showForm: false,
+        });
+    }
+
+    try {
+        const existingSubmission = await Submission.findOne({ date: selectedDate });
+        if (existingSubmission) {
+            const encodedDate = encodeURIComponent(selectedDate);
+            return res.render("insertedHome", {
+                msg: `A record already exists for the date ${selectedDate}. Try Updating.`,
+                username: req.cookies.name,
+                date: curdate(),
+                link: encodedDate,
+                insertion: true,
+            });
+        }
+
+        return res.render("newrecord" , {
+            error : null,
+            username : req.cookies.name,
+            date : curdate(),
+            role : req.cookies.role,
+            minDate,
+            maxDate,
+            selectedDateInput: rawDate,
+            selectedDate,
+            showForm: true,
+        });
+    } catch (err) {
+        console.log(err);
+        return res.render("newrecord" , {
+            error : "Something went wrong while checking date.",
+            username : req.cookies.name,
+            date : curdate(),
+            role : req.cookies.role,
+            minDate,
+            maxDate,
+            selectedDateInput: rawDate,
+            selectedDate: "",
+            showForm: false,
+        });
+    }
 })
 
 app.post("/datetoUpdate" , async (req , res) => {
     const date = req.body.date;
     const formattedDate = formatDateToPKR(date);
+    const currentDate = curdate();
     try {
         const entry = await Submission.findOne({ date: formattedDate });
         const encodedDate = encodeURIComponent(formattedDate);
-        const currentDate = curdate();
         if (entry) {
             res.redirect(`/update/${encodedDate}`);
         } else {
@@ -461,8 +596,8 @@ app.post("/datetoUpdate" , async (req , res) => {
 
 app.get('/update/:date', async (req, res) => {
     const date = req.params.date;
-    decodeddate = decodeURIComponent(date);
-    encodedDate = encodeURIComponent(date);
+    const decodeddate = decodeURIComponent(date);
+    const encodedDate = encodeURIComponent(date);
     try {
         const entry = await Submission.findOne({ date: decodeddate });
             res.render('updatingrec', { entry: entry , postingDate : encodedDate , role : req.cookies.role });
@@ -475,7 +610,7 @@ app.get('/update/:date', async (req, res) => {
 
 app.post('/update/:date', async (req, res) => {
     const date = req.params.date;
-    decodeddate = decodeURIComponent(date);
+    const decodeddate = decodeURIComponent(date);
     const { morningMilk, eveningMilk, expenses, revenues } = req.body;
     const expensesArray = Object.values(expenses || {});
     const revenuesArray = Object.values(revenues || {}); 
@@ -539,6 +674,8 @@ app.post('/update/:date', async (req, res) => {
 
 app.get("/logout" , (req , res) => {
     res.clearCookie("tId");
+    res.clearCookie("role");
+    res.clearCookie("name");
     req.session.destroy(err => {
         if (err) {
             console.log("Session destruction error:", err);
@@ -549,8 +686,7 @@ app.get("/logout" , (req , res) => {
 
 app.get("/individualRec/:date" ,async (req , res) => {
     const date = req.params.date;
-    encodedDate = encodeURIComponent(date);
-    decodedDate = decodeURIComponent(date);
+    const decodedDate = decodeURIComponent(date);
     try {
         const entry = await Submission.findOne({ date: decodedDate });
         res.render("individualRec" , { username : req.cookies.name , date : decodedDate , entry : entry , role : req.cookies.role })

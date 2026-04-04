@@ -1,3 +1,5 @@
+@import url("/styles/theme.css");
+
 /* Global Styles */
 * {
     margin: 0;
@@ -82,6 +84,19 @@ h3 {
     font-size: 28px;
     margin-bottom: 25px;
     text-align: center;  
+}
+
+.sub-heading {
+    margin-top: 22px;
+}
+
+.page-card {
+    max-width: 90%;
+    margin: 0 auto;
+}
+
+.page-card-form {
+    margin-bottom: 22px;
 }
 
 label {

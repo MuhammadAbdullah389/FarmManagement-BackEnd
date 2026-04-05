@@ -189,15 +189,36 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(deriveUser);
 
+function normalizeOrigin(origin) {
+  if (!origin) {
+    return "";
+  }
+  return origin.trim().replace(/\/+$/, "");
+}
+
 app.use((req, res, next) => {
-  const allowedOrigin = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
-  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+  const configuredOrigins = (process.env.FRONTEND_ORIGIN || "http://localhost:5173")
+    .split(",")
+    .map((origin) => normalizeOrigin(origin))
+    .filter(Boolean);
+
+  const requestOrigin = normalizeOrigin(req.headers.origin || "");
+  const isAllowed = configuredOrigins.includes(requestOrigin);
+
+  if (isAllowed) {
+    // Echo the request origin for exact browser CORS matching.
+    res.setHeader("Access-Control-Allow-Origin", requestOrigin);
+  }
+
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 
   if (req.method === "OPTIONS") {
+    if (!isAllowed) {
+      return res.sendStatus(403);
+    }
     return res.sendStatus(204);
   }
 

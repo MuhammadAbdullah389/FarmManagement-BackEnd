@@ -265,12 +265,13 @@ app.post(["/api/auth/login", "/login"], async (req, res) => {
 
   const token = setUser(user);
   const oneMonth = 30 * 24 * 60 * 60 * 1000;
+  const isProd = process.env.NODE_ENV === "production";
 
   res.cookie("tId", token, {
     expires: new Date(Date.now() + oneMonth),
     httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    sameSite: isProd ? "none" : "lax",
+    secure: isProd,
   });
 
   return sendSuccess(res, {

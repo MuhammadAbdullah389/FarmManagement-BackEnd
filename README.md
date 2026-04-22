@@ -1,53 +1,64 @@
 # Farm Management Backend API
 
-This backend is now API-only. It serves JSON responses for the frontend and uses cookie-based JWT authentication.
+API-only backend for Advanced FMS. It serves JSON responses, uses cookie-based JWT auth, supports daily farm records, monthly reports, and HR employee/transaction workflows.
 
-## Overview
+## Highlights
 
-- Total documented API endpoint groups: 13
-- Total route bindings in the current server, including legacy aliases: 18
-- Public endpoints: 3
-- Auth-protected endpoints: 6
-- Admin-protected endpoints: 4
-- Response style: JSON only
-- Auth style: cookie-based JWT via `tId`
-- Frontend integration style: SPA / API consumer
+- Cookie auth with `tId` (httpOnly)
+- Role-based access (`user`, `admin`)
+- Daily record create/update with month-aware validation
+- Monthly report summaries (`opening`, `net`, `closing`)
+- HR module: employees, transactions, settlement preview/execute, mark-left
+- HR transaction sync into daily records as readonly line items
+- Monthly consistency logic with incremental rebuild from dirty month
 
-### Quick Snapshot
+## Insights Snapshot
 
-- Backend role: API server for the React frontend
-- Data scope: daily records and monthly reports stored in MongoDB
-- Main use cases: login, record CRUD, monthly reporting, session check
-- Legacy SSR views and static assets have been removed
+- Total route declarations in `server.js`: 27
+- Total route bindings including legacy aliases: 38
+- Canonical `/api/*` routes: 21
+- Public route declarations: 5
+- Auth-protected route declarations: 7
+- Admin-protected route declarations: 15
+
+Notes:
+
+- Counts above include legacy compatibility aliases where present.
+- Role counts are based on route middleware usage (`requireAuth`, `requireAdmin`).
 
 ## Tech Stack
 
 - Node.js
 - Express.js
-- MongoDB
-- Mongoose
-- JSON Web Token (`jsonwebtoken`)
-- `cookie-parser`
-- `dotenv`
+- MongoDB + Mongoose
+- jsonwebtoken
+- cookie-parser
+- dotenv
 
 ## Base URL
 
 - Local: `http://localhost:3000`
-- Production: your deployed Render URL
+- Production: your deployed backend URL
 
-## Important Rules
+## Environment Variables
 
-- All authenticated requests must include credentials.
-- Frontend fetch example: `credentials: "include"`
-- Axios example: `withCredentials: true`
+- `PORT` optional, default `3000`
+- `DB_URL` required, MongoDB connection string
+- `SECRET_KEY` required, JWT signing key
+- `FRONTEND_ORIGIN` required, comma-separated allowed origins without trailing slash
+- `MILKPRICE` optional, default milk price fallback
+
+## Auth And CORS Rules
+
 - Auth cookie name: `tId`
-- Cookie is `httpOnly`
-- CORS is configured through `FRONTEND_ORIGIN`
-- Do not include a trailing slash in `FRONTEND_ORIGIN`
+- Frontend must send credentials on authenticated calls
+- Fetch: `credentials: "include"`
+- Axios: `withCredentials: true`
+- CORS allow-list is derived from `FRONTEND_ORIGIN`
 
-## Common Response Format
+## Common Response Envelope
 
-### Success
+Success:
 
 ```json
 {
@@ -57,7 +68,7 @@ This backend is now API-only. It serves JSON responses for the frontend and uses
 }
 ```
 
-### Error
+Error:
 
 ```json
 {
@@ -67,464 +78,148 @@ This backend is now API-only. It serves JSON responses for the frontend and uses
 }
 ```
 
-## Auth / Role Rules
+## Data Model Notes
 
-- Public: health and login/logout
-- Auth required: user session endpoints, records list, record detail, report list, monthly report
-- Admin required: create/update/check/resolve record endpoints
+### Daily Record
 
-## Data Formats
-
-### User Object
-
-```json
-{
-  "id": "string",
-  "name": "string",
-  "email": "string",
-  "role": "user | admin"
-}
-```
-
-### Money Item Object
+Daily line items now support source metadata.
 
 ```json
 {
   "description": "string",
-  "amount": 0
+  "amount": 0,
+  "readonly": false,
+  "source": "manual | hr",
+  "sourceRefType": "hr_transaction | null",
+  "sourceRefId": "string | null"
 }
 ```
 
-### Daily Record Object
+Readonly HR-synced line items are preserved by backend during daily record updates.
+
+### HR Transaction
 
 ```json
 {
-  "date": "dd/mm/yyyy",
-  "morningMilkQuantity": 0,
-  "eveningMilkQuantity": 0,
-  "milkPrice": 0,
-  "expenses": [],
-  "revenues": [],
-  "totalRevenue": 0,
-  "totalExpenditure": 0,
-  "Balance": 0
+  "_id": "string",
+  "type": "advance | payback",
+  "amount": 0,
+  "note": "string",
+  "transactionDate": "dd/mm/yyyy",
+  "settledAt": "date | null"
 }
 ```
 
-### Monthly Report Object
-
-```json
-{
-  "month": "MM-YYYY",
-  "openingBalance": 0,
-  "netBalance": 0,
-  "closingBalance": 0,
-  "startDate": "dd/mm/yyyy",
-  "endDate": "dd/mm/yyyy"
-}
-```
+Only unsettled HR transactions can be edited.
 
 ## API Endpoints
 
-### 1) Health
+### Health And Auth
 
-| Method | Path | Auth | Purpose |
+| Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/api/health` | Public | Check if server is running |
+| GET | /api/health | Public | Service health |
+| POST | /api/auth/login | Public | Login and set cookie |
+| GET | /api/auth/me | Auth | Current user |
+| POST | /api/auth/logout | Public | Logout |
 
-**Response data**
+### Dashboard
 
-```json
-{
-  "up": true,
-  "date": "dd/mm/yyyy"
-}
-```
-
----
-
-### 2) Login
-
-| Method | Path | Auth | Purpose |
+| Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
-| `POST` | `/api/auth/login` | Public | Login user and set auth cookie |
+| GET | / | Auth | Dashboard payload |
+| GET | /home | Auth | Dashboard payload |
 
-**Request body**
+### Daily Records
 
-```json
-{
-  "email": "admin@example.com",
-  "password": "password123"
-}
-```
-
-**Response data**
-
-```json
-{
-  "user": {
-    "id": "string",
-    "name": "string",
-    "email": "string",
-    "role": "admin"
-  }
-}
-```
-
-**Notes**
-- Sets cookie `tId` on success.
-- Use credentials in the frontend request.
-
----
-
-### 3) Current Logged-In User
-
-| Method | Path | Auth | Purpose |
+| Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/api/auth/me` | Required | Return current authenticated user |
+| GET | /api/records | Auth | List records by month/year |
+| GET | /api/records/:date | Auth | Single record detail |
+| POST | /api/records | Admin | Create record |
+| PUT | /api/records/:date | Admin | Update record |
+| POST | /api/records/check-new-date | Admin | Validate create date |
+| POST | /api/records/resolve-date | Admin | Resolve date for update |
 
-**Response data**
+Request body for create/update still uses map-style `expenses` and `revenues` objects.
 
-```json
-{
-  "user": {
-    "id": "string",
-    "name": "string",
-    "email": "string",
-    "role": "admin"
-  }
-}
-```
+### Monthly Reports
 
----
-
-### 4) Logout
-
-| Method | Path | Auth | Purpose |
+| Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
-| `POST` | `/api/auth/logout` | Public | Clear auth cookie |
+| GET | /api/reports/months | Auth | Available months |
+| GET | /api/reports/:month | Auth | Monthly report by `MM-YYYY` or `Month YYYY` |
 
-**Response data**
+### HR Module
 
-```json
-null
-```
-
----
-
-### 5) Dashboard Payload
-
-| Method | Path | Auth | Purpose |
+| Method | Path | Access | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/` | Required | Dashboard data |
-| `GET` | `/home` | Required | Dashboard data |
+| GET | /api/hr/overview | Admin | HR dashboard summary |
+| POST | /api/hr/employees | Admin | Add employee |
+| GET | /api/hr/employees/:id | Admin | Employee detail |
+| POST | /api/hr/employees/:id/transactions | Admin | Add advance/payback |
+| PUT | /api/hr/employees/:id/transactions/:transactionId | Admin | Edit unsettled transaction |
+| POST | /api/hr/employees/:id/increase-pay | Admin | Increase salary |
+| POST | /api/hr/employees/:id/settlement-preview | Admin | Settlement preview |
+| POST | /api/hr/employees/:id/settle | Admin | Execute settlement |
+| POST | /api/hr/employees/:id/mark-left | Admin | Mark employee left |
 
-**Response data**
+## HR To Daily Record Sync Behavior
 
-```json
-{
-  "user": {
-    "id": "string",
-    "name": "string",
-    "email": "string",
-    "role": "admin"
-  },
-  "today": "dd/mm/yyyy",
-  "todayEntryExists": true
-}
-```
+Implemented behavior:
 
----
+1. HR advance creates/updates a readonly expense line in daily record.
+2. HR payback creates/updates a readonly revenue line in daily record.
+3. Editing an unsettled HR transaction updates its linked readonly daily line, including date/type/amount/note changes.
+4. Daily record edit endpoints cannot overwrite HR readonly lines.
 
-### 6) List Records By Month
+Generated description pattern:
 
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/records` | Required | List records for a month |
+- `HR Advance - Employee Name (optional note)`
+- `HR Payback - Employee Name (optional note)`
 
-**Query params**
+## Monthly Consistency Logic
 
-- `month` optional, number `1` to `12`
-- `year` optional, full year like `2026`
+Monthly report consistency is maintained with incremental rebuild:
 
-**Response data**
+1. Writes mark a dirty start month.
+2. Rebuild runs from earliest dirty month forward.
+3. Opening/closing balances are recomputed in sequence.
+4. Report reads ensure data is up to date when dirty.
 
-```json
-{
-  "entries": [],
-  "currentMonth": 4,
-  "currentYear": 2026,
-  "monthDisplay": "April",
-  "prevMonth": 3,
-  "prevYear": 2026,
-  "nextMonth": 5,
-  "nextYear": 2026,
-  "canGoToNextMonth": true,
-  "user": {
-    "name": "Admin",
-    "role": "admin"
-  },
-  "date": "dd/mm/yyyy"
-}
-```
+This prevents drift between month closing and next month opening.
 
----
-
-### 7) Get Single Record
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/records/:date` | Required | Fetch one record by date |
-
-**Path param**
-
-- `date` must be `dd/mm/yyyy`
-- URL-encode it if needed
-
-**Response data**
-
-```json
-{
-  "entry": {},
-  "date": "dd/mm/yyyy",
-  "postingDate": "encoded-date",
-  "user": {
-    "name": "Admin",
-    "role": "admin"
-  }
-}
-```
-
----
-
-### 8) Create Record
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `POST` | `/api/records` | Admin | Create a new daily record |
-
-**Request body**
-
-```json
-{
-  "recordDate": "dd/mm/yyyy",
-  "morningMilk": 10,
-  "eveningMilk": 12,
-  "expenses": {
-    "0": {
-      "description": "Feed",
-      "amount": 500
-    }
-  },
-  "revenues": {
-    "0": {
-      "description": "Other sale",
-      "amount": 300
-    }
-  }
-}
-```
-
-**Notes**
-- `recordDate` is optional. If omitted, current date is used.
-- `expenses` and `revenues` are object maps, not arrays.
-- Each item must include `description` and `amount`.
-
-**Response data**
-
-```json
-{
-  "date": "dd/mm/yyyy",
-  "submission": {}
-}
-```
-
----
-
-### 9) Update Record
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `PUT` | `/api/records/:date` | Admin | Update an existing record |
-
-**Path param**
-
-- `date` must be `dd/mm/yyyy`
-- URL-encode it if needed
-
-**Request body**
-
-```json
-{
-  "morningMilk": 10,
-  "eveningMilk": 12,
-  "expenses": {
-    "0": {
-      "description": "Feed",
-      "amount": 500
-    }
-  },
-  "revenues": {
-    "0": {
-      "description": "Other sale",
-      "amount": 300
-    }
-  }
-}
-```
-
-**Response data**
-
-```json
-{
-  "date": "dd/mm/yyyy",
-  "updatedEntry": {}
-}
-```
-
----
-
-### 10) Check New Record Date
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `POST` | `/api/records/check-new-date` | Admin | Validate a current-month date before creating a new record |
-
-**Request body**
-
-```json
-{
-  "date": "2026-04-05"
-}
-```
-
-**Response data**
-
-```json
-{
-  "minDate": "2026-04-01",
-  "maxDate": "2026-04-30",
-  "selectedDateInput": "2026-04-05",
-  "selectedDate": "05/04/2026"
-}
-```
-
-**Errors**
-- `400` if date is not in the current month
-- `409` if record already exists
-
----
-
-### 11) Resolve Date For Update
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `POST` | `/api/records/resolve-date` | Admin | Convert input date and verify record exists |
-
-**Request body**
-
-```json
-{
-  "date": "2026-04-05"
-}
-```
-
-**Response data**
-
-```json
-{
-  "requestedDate": "2026-04-05",
-  "formattedDate": "05/04/2026",
-  "encodedDate": "05%2F04%2F2026"
-}
-```
-
----
-
-### 12) List Report Months
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/reports/months` | Required | List all available monthly reports |
-
-**Response data**
-
-```json
-{
-  "months": ["April 2026"],
-  "rawMonths": [],
-  "user": {
-    "name": "Admin",
-    "role": "admin"
-  },
-  "date": "dd/mm/yyyy"
-}
-```
-
----
-
-### 13) Monthly Report
-
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/api/reports/:month` | Required | Get records and summary for one month |
-
-**Path param formats accepted**
-- `MM-YYYY` like `04-2026`
-- `Month YYYY` like `April 2026`
-
-**Response data**
-
-```json
-{
-  "month": "04",
-  "year": "2026",
-  "records": [],
-  "monthlyRep": {},
-  "user": {
-    "name": "Admin",
-    "role": "admin"
-  },
-  "date": "dd/mm/yyyy"
-}
-```
-
----
-
-## Error Status Codes
+## Status Codes
 
 | Status | Meaning |
 | --- | --- |
-| `400` | Invalid input or date format |
-| `401` | Not authenticated |
-| `403` | Authenticated but not admin |
-| `404` | Resource not found |
-| `409` | Duplicate/conflict |
-| `500` | Server error |
+| 400 | Validation or date window error |
+| 401 | Authentication required |
+| 403 | Admin required |
+| 404 | Resource not found |
+| 409 | Duplicate/conflict |
+| 500 | Server error |
 
-## Frontend Integration Example
+## Local Run
 
-### Fetch
+1. Install dependencies:
 
-```js
-const res = await fetch("https://your-backend-url/api/auth/me", {
-  method: "GET",
-  credentials: "include",
-});
+```bash
+npm install
 ```
 
-### Axios
+2. Set environment variables in `.env`.
 
-```js
-const res = await axios.get("https://your-backend-url/api/auth/me", {
-  withCredentials: true,
-});
+3. Start server:
+
+```bash
+node server.js
 ```
 
-## Notes For Frontend Dev
+## Frontend Integration Notes
 
-- Always send credentials for authenticated requests.
-- Always use the `/api/*` routes.
-- Do not depend on legacy SSR routes.
-- Dates are stored as `dd/mm/yyyy` in daily records.
-- Month routes use `MM-YYYY` or `Month YYYY`.
+- Always call `/api/*` routes.
+- Always include credentials on authenticated requests.
+- Daily dates are stored as `dd/mm/yyyy`.
+- Report month supports `MM-YYYY` and `Month YYYY`.
+- Daily record responses may include readonly HR line items with metadata.

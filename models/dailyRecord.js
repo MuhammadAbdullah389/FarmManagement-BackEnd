@@ -1,5 +1,32 @@
 const mongoose = require('mongoose');
 
+const lineItemSchema = new mongoose.Schema({
+    description: {
+        type: String,
+        required: true,
+    },
+    amount: {
+        type: Number,
+        required: true,
+    },
+    readonly: {
+        type: Boolean,
+        default: false,
+    },
+    source: {
+        type: String,
+        default: "manual",
+    },
+    sourceRefType: {
+        type: String,
+        default: null,
+    },
+    sourceRefId: {
+        type: String,
+        default: null,
+    },
+}, { _id: false });
+
 const submissionSchema = new mongoose.Schema({
     date: { 
         type: String, 
@@ -18,30 +45,8 @@ const submissionSchema = new mongoose.Schema({
         type: Number, 
         required: true 
     },
-    expenses: [
-        {
-            description: { 
-                type: String, 
-                required: true 
-            }, 
-            amount: { 
-                type: Number, 
-                required: true 
-            }, 
-        }
-    ],
-    revenues: [
-        {
-            description: { 
-                type: String, 
-                required: true 
-            },
-            amount: { 
-                type: Number, 
-                required: true 
-            }, 
-        }
-    ],
+    expenses: [lineItemSchema],
+    revenues: [lineItemSchema],
     totalRevenue : {
         type: Number, 
         required: true         

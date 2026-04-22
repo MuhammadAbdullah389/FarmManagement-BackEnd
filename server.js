@@ -6,6 +6,7 @@ const conn = require("./controllers/connecttoDB");
 const curdate = require("./controllers/currentdate");
 const Submission = require("./models/dailyRecord");
 const MonthlyReport = require("./models/monthlyRecord");
+const HrEmployee = require("./models/hrEmployee");
 const { verifyUser } = require("./controllers/verifyUser");
 const { setUser, getUser } = require("./service/auth");
 
@@ -65,6 +66,147 @@ function formatMonth(monthYear) {
   return `${monthName} ${year}`;
 }
 
+function parsePkrDateToObject(dateValue) {
+  const [day, month, year] = String(dateValue || "").split("/").map(Number);
+  return new Date(year, (month || 1) - 1, day || 1);
+}
+
+function monthKeyFromDate(dateObj) {
+  const month = String(dateObj.getMonth() + 1).padStart(2, "0");
+  const year = dateObj.getFullYear();
+  return `${month}-${year}`;
+}
+
+function parseMonthKey(monthKey) {
+  const [monthRaw, yearRaw] = String(monthKey || "").split("-");
+  return {
+    month: Number(monthRaw),
+    year: Number(yearRaw),
+  };
+}
+
+function compareMonthKeys(a, b) {
+  const aParsed = parseMonthKey(a);
+  const bParsed = parseMonthKey(b);
+  if (aParsed.year !== bParsed.year) {
+    return aParsed.year - bParsed.year;
+  }
+  return aParsed.month - bParsed.month;
+}
+
+let monthlyReportsDirtyFromMonth = null;
+
+function monthKeyFromPkrDateString(dateValue) {
+  const dateObj = parsePkrDateToObject(dateValue);
+  if (Number.isNaN(dateObj.getTime())) {
+    return null;
+  }
+  return monthKeyFromDate(dateObj);
+}
+
+function markMonthlyReportsDirty(monthKey) {
+  if (!monthKey) {
+    return;
+  }
+
+  if (!monthlyReportsDirtyFromMonth || compareMonthKeys(monthKey, monthlyReportsDirtyFromMonth) < 0) {
+    monthlyReportsDirtyFromMonth = monthKey;
+  }
+}
+
+async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
+  const submissions = await Submission.find({}, { date: 1, Balance: 1 }).lean();
+  const netByMonth = new Map();
+
+  submissions.forEach((entry) => {
+    const dateObj = parsePkrDateToObject(entry.date);
+    if (Number.isNaN(dateObj.getTime())) {
+      return;
+    }
+
+    const monthKey = monthKeyFromDate(dateObj);
+    const existing = netByMonth.get(monthKey) || 0;
+    netByMonth.set(monthKey, existing + Number(entry.Balance || 0));
+  });
+
+  const sortedMonths = Array.from(netByMonth.keys()).sort(compareMonthKeys);
+
+  if (sortedMonths.length === 0) {
+    await MonthlyReport.deleteMany({});
+    return;
+  }
+
+  const effectiveFromMonth = fromMonthKey || sortedMonths[0];
+  const monthsToRebuild = sortedMonths.filter((monthKey) => compareMonthKeys(monthKey, effectiveFromMonth) >= 0);
+
+  if (monthsToRebuild.length === 0) {
+    const storedReports = await MonthlyReport.find({}, { _id: 1, month: 1 }).lean();
+    const staleIds = storedReports
+      .filter((report) => compareMonthKeys(report.month, effectiveFromMonth) >= 0)
+      .map((report) => report._id);
+
+    if (staleIds.length > 0) {
+      await MonthlyReport.deleteMany({ _id: { $in: staleIds } });
+    }
+
+    return;
+  }
+
+  let previousClosingBalance = 0;
+  const previousMonth = sortedMonths
+    .filter((monthKey) => compareMonthKeys(monthKey, monthsToRebuild[0]) < 0)
+    .slice(-1)[0];
+
+  if (previousMonth) {
+    const previousReport = await MonthlyReport.findOne({ month: previousMonth }, { closingBalance: 1 }).lean();
+    previousClosingBalance = Number(previousReport?.closingBalance || 0);
+  }
+
+  for (const monthKey of monthsToRebuild) {
+    const { month, year } = parseMonthKey(monthKey);
+    const startDate = formatDateToPKR(new Date(year, month - 1, 1));
+    const endDate = formatDateToPKR(new Date(year, month, 0));
+    const openingBalance = roundMoney(previousClosingBalance);
+    const netBalance = roundMoney(netByMonth.get(monthKey) || 0);
+    const closingBalance = roundMoney(openingBalance + netBalance);
+
+    await MonthlyReport.updateOne(
+      { month: monthKey },
+      {
+        $set: {
+          openingBalance,
+          netBalance,
+          closingBalance,
+          startDate,
+          endDate,
+        },
+      },
+      { upsert: true },
+    );
+
+    previousClosingBalance = closingBalance;
+  }
+
+  const storedReports = await MonthlyReport.find({}, { _id: 1, month: 1 }).lean();
+  const staleIds = storedReports
+    .filter((report) => compareMonthKeys(report.month, monthsToRebuild[0]) >= 0 && !netByMonth.has(report.month))
+    .map((report) => report._id);
+
+  if (staleIds.length > 0) {
+    await MonthlyReport.deleteMany({ _id: { $in: staleIds } });
+  }
+}
+
+async function ensureMonthlyReportsUpToDate() {
+  if (!monthlyReportsDirtyFromMonth) {
+    return;
+  }
+
+  const fromMonth = monthlyReportsDirtyFromMonth;
+  await rebuildMonthlyReportsFromMonth(fromMonth);
+  monthlyReportsDirtyFromMonth = null;
+}
+
 function isCurrentMonthDate(ddmmyyyy) {
   const [day, month, year] = ddmmyyyy.split("/").map(Number);
   const selected = new Date(year, month - 1, day);
@@ -85,6 +227,191 @@ function getCurrentMonthInputRange() {
   const maxDate = `${year}-${monthStr}-${String(lastDay).padStart(2, "0")}`;
 
   return { minDate, maxDate };
+}
+
+function roundMoney(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
+function roundUpMoney(value) {
+  const numeric = Number(value || 0);
+  if (!Number.isFinite(numeric)) {
+    return 0;
+  }
+
+  const rounded = Math.ceil(numeric * 100) / 100;
+  return Math.abs(rounded) < 0.000001 ? 0 : rounded;
+}
+
+function parseDateToPKR(dateValue) {
+  if (!dateValue) {
+    return curdate();
+  }
+
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(dateValue)) {
+    return dateValue;
+  }
+
+  return formatDateToPKR(dateValue);
+}
+
+function pkrDateToYmd(dateValue) {
+  const [day, month, year] = dateValue.split("/").map(Number);
+  return formatDateToYMD(new Date(year, month - 1, day));
+}
+
+function daysInclusive(startDate, endDate) {
+  const start = new Date(pkrDateToYmd(startDate));
+  const end = new Date(pkrDateToYmd(endDate));
+  const diff = Math.floor((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+  return Math.max(1, diff);
+}
+
+function calculateProratedBasePay(monthlyPay, startDate, endDate) {
+  let cursor = new Date(pkrDateToYmd(startDate));
+  const last = new Date(pkrDateToYmd(endDate));
+
+  if (cursor > last) {
+    return roundUpMoney(monthlyPay / 30);
+  }
+
+  let total = 0;
+
+  while (cursor <= last) {
+    const year = cursor.getFullYear();
+    const month = cursor.getMonth();
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    total += Number(monthlyPay || 0) / daysInMonth;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return roundUpMoney(total);
+}
+
+function getEmployeeSettlementSnapshot(employee, settlementDate = curdate()) {
+  const lastSettlementDate = employee.lastSettlementDate || employee.joiningDate;
+  const startYmd = pkrDateToYmd(lastSettlementDate);
+  const endYmd = pkrDateToYmd(settlementDate);
+  const isFirstSettlement = (employee.settlements || []).length === 0;
+  const sameDaySettlement = startYmd === endYmd;
+  const zeroBaseSameDay = sameDaySettlement && !isFirstSettlement;
+  const eligibleTransactions = (employee.transactions || []).filter((transaction) => {
+    if (transaction.settledAt) {
+      return false;
+    }
+
+    const transactionYmd = pkrDateToYmd(transaction.transactionDate);
+    return transactionYmd >= startYmd && transactionYmd <= endYmd;
+  });
+
+  const advances = eligibleTransactions.filter((transaction) => transaction.type === "advance");
+  const paybacks = eligibleTransactions.filter((transaction) => transaction.type === "payback");
+  const daysWorked = zeroBaseSameDay ? 0 : daysInclusive(lastSettlementDate, settlementDate);
+  const basePay = zeroBaseSameDay ? 0 : calculateProratedBasePay(employee.monthlyPay, lastSettlementDate, settlementDate);
+  const dailyRate = daysWorked > 0 ? roundUpMoney(basePay / daysWorked) : 0;
+  const advancesTotal = roundMoney(advances.reduce((sum, transaction) => sum + Number(transaction.amount || 0), 0));
+  const paybacksTotal = roundMoney(paybacks.reduce((sum, transaction) => sum + Number(transaction.amount || 0), 0));
+  const netPay = roundUpMoney(basePay + paybacksTotal - advancesTotal);
+
+  return {
+    settlementDate,
+    lastSettlementDate,
+    daysWorked,
+    dailyRate,
+    basePay,
+    advancesTotal,
+    paybacksTotal,
+    netPay,
+    eligibleTransactions,
+  };
+}
+
+function validateSettlementDateWindow(employee, settlementDate) {
+  const lastSettlementDate = employee.lastSettlementDate || employee.joiningDate;
+  const settlementYmd = pkrDateToYmd(settlementDate);
+  const lastSettlementYmd = pkrDateToYmd(lastSettlementDate);
+  const todayYmd = pkrDateToYmd(curdate());
+
+  if (settlementYmd < lastSettlementYmd) {
+    return {
+      valid: false,
+      message: `Settlement date cannot be before last settlement date (${lastSettlementDate})`,
+    };
+  }
+
+  if (settlementYmd > todayYmd) {
+    return {
+      valid: false,
+      message: "Settlement date cannot be in the future",
+    };
+  }
+
+  return { valid: true };
+}
+
+function validateLeftDateWindow(employee, leftDate) {
+  const leftYmd = pkrDateToYmd(leftDate);
+  const joiningYmd = pkrDateToYmd(employee.joiningDate);
+  const lastSettlementYmd = pkrDateToYmd(employee.lastSettlementDate || employee.joiningDate);
+  const todayYmd = pkrDateToYmd(curdate());
+
+  if (leftYmd < joiningYmd) {
+    return {
+      valid: false,
+      message: `Left date cannot be before joining date (${employee.joiningDate})`,
+    };
+  }
+
+  if (leftYmd < lastSettlementYmd) {
+    return {
+      valid: false,
+      message: `Left date cannot be before last settlement date (${employee.lastSettlementDate || employee.joiningDate})`,
+    };
+  }
+
+  if (leftYmd > todayYmd) {
+    return {
+      valid: false,
+      message: "Left date cannot be in the future",
+    };
+  }
+
+  return { valid: true };
+}
+
+function formatEmployeeSummary(employee, settlementDate = curdate()) {
+  const snapshot = getEmployeeSettlementSnapshot(employee, settlementDate);
+  return {
+    id: employee._id,
+    name: employee.name,
+    monthlyPay: employee.monthlyPay,
+    joiningDate: employee.joiningDate,
+    lastSettlementDate: employee.lastSettlementDate,
+    currentDue: snapshot.netPay,
+    netBalance: snapshot.netPay,
+    advancesTotal: snapshot.advancesTotal,
+    paybacksTotal: snapshot.paybacksTotal,
+    pendingTransactions: snapshot.eligibleTransactions.length,
+    settlementCount: (employee.settlements || []).length,
+    employmentStatus: employee.employmentStatus || "active",
+    leftDate: employee.leftDate || null,
+    payAtLeaving: employee.payAtLeaving || null,
+    netBalanceAtLeaving: Number(employee.netBalanceAtLeaving || 0),
+  };
+}
+
+function formatLeftEmployeeSummary(employee) {
+  const storedPayAtLeaving = Number(employee.payAtLeaving || 0);
+  const safePayAtLeaving = storedPayAtLeaving > 0 ? storedPayAtLeaving : Number(employee.monthlyPay || 0);
+
+  return {
+    id: employee._id,
+    name: employee.name,
+    joiningDate: employee.joiningDate,
+    leftDate: employee.leftDate || null,
+    payAtLeaving: safePayAtLeaving,
+    netBalanceAtLeaving: Number(employee.netBalanceAtLeaving || 0),
+  };
 }
 
 function sendSuccess(res, data, message = "OK", status = 200) {
@@ -132,10 +459,172 @@ function normalizeAmounts(list) {
   return arr;
 }
 
+function sanitizeLineItemDescription(value) {
+  return String(value || "").trim();
+}
+
+function isReadonlyDailyLineItem(item) {
+  return Boolean(item && (item.readonly || item.source === "hr"));
+}
+
+function splitDailyLineItems(items) {
+  const readonlyItems = [];
+  const editableItems = [];
+
+  (items || []).forEach((item) => {
+    if (isReadonlyDailyLineItem(item)) {
+      readonlyItems.push(item);
+    } else {
+      editableItems.push(item);
+    }
+  });
+
+  return { readonlyItems, editableItems };
+}
+
+function normalizeEditableLineItems(items) {
+  return (items || [])
+    .map((item) => ({
+      description: sanitizeLineItemDescription(item.description),
+      amount: Number(item.amount || 0),
+      readonly: false,
+      source: "manual",
+      sourceRefType: null,
+      sourceRefId: null,
+    }))
+    .filter((item) => item.description && item.amount > 0)
+    .map((item) => ({ ...item, amount: roundMoney(item.amount) }));
+}
+
+function normalizeReadonlyLineItems(items) {
+  return (items || [])
+    .filter((item) => isReadonlyDailyLineItem(item))
+    .map((item) => ({
+      description: sanitizeLineItemDescription(item.description),
+      amount: roundMoney(Number(item.amount || 0)),
+      readonly: true,
+      source: item.source || "hr",
+      sourceRefType: item.sourceRefType || null,
+      sourceRefId: item.sourceRefId ? String(item.sourceRefId) : null,
+    }))
+    .filter((item) => item.description && item.amount > 0);
+}
+
+function calculateRecordTotals(morningMilk, eveningMilk, milkRate, expensesArray, revenuesArray) {
+  const milkRevenue = (Number(morningMilk || 0) + Number(eveningMilk || 0)) * Number(milkRate || 0);
+  const totalExpenses = (expensesArray || []).reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
+  const totalRevenue = (revenuesArray || []).reduce((sum, revenue) => sum + Number(revenue.amount || 0), 0) + milkRevenue;
+  const balance = totalRevenue - totalExpenses;
+
+  return {
+    milkRevenue: roundMoney(milkRevenue),
+    totalExpenses: roundMoney(totalExpenses),
+    totalRevenue: roundMoney(totalRevenue),
+    balance: roundMoney(balance),
+  };
+}
+
+function buildHrDailyLineItem(employee, transaction) {
+  const refId = String(transaction._id);
+  const prefix = transaction.type === "advance" ? "HR Advance" : "HR Payback";
+  const note = sanitizeLineItemDescription(transaction.note);
+  const baseDescription = `${prefix} - ${sanitizeLineItemDescription(employee.name) || "Employee"}`;
+  const description = note ? `${baseDescription} (${note})` : baseDescription;
+
+  return {
+    description,
+    amount: roundMoney(Number(transaction.amount || 0)),
+    readonly: true,
+    source: "hr",
+    sourceRefType: "hr_transaction",
+    sourceRefId: refId,
+  };
+}
+
+async function removeHrTransactionFromDailyRecords(transactionId, dateHint = null) {
+  const refId = String(transactionId);
+  const baseQuery = {
+    $or: [
+      { "expenses.sourceRefId": refId },
+      { "revenues.sourceRefId": refId },
+    ],
+  };
+  const query = dateHint ? { ...baseQuery, date: dateHint } : baseQuery;
+  const records = await Submission.find(query);
+
+  for (const record of records) {
+    const nextExpenses = (record.expenses || []).filter((item) => String(item.sourceRefId || "") !== refId);
+    const nextRevenues = (record.revenues || []).filter((item) => String(item.sourceRefId || "") !== refId);
+    const removed = nextExpenses.length !== (record.expenses || []).length
+      || nextRevenues.length !== (record.revenues || []).length;
+
+    if (!removed) {
+      continue;
+    }
+
+    const totals = calculateRecordTotals(
+      record.morningMilkQuantity,
+      record.eveningMilkQuantity,
+      record.milkPrice,
+      nextExpenses,
+      nextRevenues,
+    );
+
+    record.expenses = nextExpenses;
+    record.revenues = nextRevenues;
+    record.totalRevenue = totals.totalRevenue;
+    record.totalExpenditure = totals.totalExpenses;
+    record.Balance = totals.balance;
+    await record.save();
+    markMonthlyReportsDirty(monthKeyFromPkrDateString(record.date));
+  }
+}
+
+async function upsertHrTransactionIntoDailyRecord(employee, transaction) {
+  const transactionDate = parseDateToPKR(transaction.transactionDate || curdate());
+  let record = await Submission.findOne({ date: transactionDate });
+
+  if (!record) {
+    const milkRate = Number(milkPrice || 0);
+    record = new Submission({
+      date: transactionDate,
+      morningMilkQuantity: 0,
+      eveningMilkQuantity: 0,
+      milkPrice: milkRate,
+      expenses: [],
+      revenues: [],
+      totalRevenue: 0,
+      totalExpenditure: 0,
+      Balance: 0,
+    });
+  }
+
+  const refId = String(transaction._id);
+  record.expenses = (record.expenses || []).filter((item) => String(item.sourceRefId || "") !== refId);
+  record.revenues = (record.revenues || []).filter((item) => String(item.sourceRefId || "") !== refId);
+
+  const targetKey = transaction.type === "advance" ? "expenses" : "revenues";
+  record[targetKey] = [...(record[targetKey] || []), buildHrDailyLineItem(employee, transaction)];
+
+  const totals = calculateRecordTotals(
+    record.morningMilkQuantity,
+    record.eveningMilkQuantity,
+    record.milkPrice,
+    record.expenses,
+    record.revenues,
+  );
+
+  record.totalRevenue = totals.totalRevenue;
+  record.totalExpenditure = totals.totalExpenses;
+  record.Balance = totals.balance;
+  await record.save();
+  markMonthlyReportsDirty(monthKeyFromPkrDateString(transactionDate));
+}
+
 async function updateRecordHandler(req, res, decodedDate) {
   const { morningMilk, eveningMilk, expenses, revenues } = req.body;
-  const expensesArray = normalizeAmounts(expenses);
-  const revenuesArray = normalizeAmounts(revenues);
+  const incomingExpenses = normalizeAmounts(expenses);
+  const incomingRevenues = normalizeAmounts(revenues);
 
   try {
     const oldEntry = await Submission.findOne({ date: decodedDate });
@@ -143,11 +632,16 @@ async function updateRecordHandler(req, res, decodedDate) {
       return sendError(res, "Record not found", 404);
     }
 
-    const currentMilkPrice = oldEntry?.milkPrice ?? milkPrice;
-    const milkRevenue = (+morningMilk + +eveningMilk) * currentMilkPrice;
-    const totalExpenses = expensesArray.reduce((sum, expense) => sum + expense.amount, 0);
-    const totalRevenue = revenuesArray.reduce((sum, revenue) => sum + revenue.amount, 0) + milkRevenue;
-    const balance = totalRevenue - totalExpenses;
+    const currentMilkPrice = Number(oldEntry?.milkPrice ?? milkPrice);
+    const { readonlyItems: readonlyExpenses } = splitDailyLineItems(oldEntry.expenses || []);
+    const { readonlyItems: readonlyRevenues } = splitDailyLineItems(oldEntry.revenues || []);
+    const editableExpenses = normalizeEditableLineItems(incomingExpenses);
+    const editableRevenues = normalizeEditableLineItems(incomingRevenues);
+    const normalizedReadonlyExpenses = normalizeReadonlyLineItems(readonlyExpenses);
+    const normalizedReadonlyRevenues = normalizeReadonlyLineItems(readonlyRevenues);
+    const expensesArray = [...editableExpenses, ...normalizedReadonlyExpenses];
+    const revenuesArray = [...editableRevenues, ...normalizedReadonlyRevenues];
+    const totals = calculateRecordTotals(morningMilk, eveningMilk, currentMilkPrice, expensesArray, revenuesArray);
 
     const updatedEntry = await Submission.findOneAndUpdate(
       { date: decodedDate },
@@ -157,23 +651,15 @@ async function updateRecordHandler(req, res, decodedDate) {
         milkPrice: currentMilkPrice,
         expenses: expensesArray,
         revenues: revenuesArray,
-        totalRevenue,
-        totalExpenditure: totalExpenses,
-        Balance: balance,
+        totalRevenue: totals.totalRevenue,
+        totalExpenditure: totals.totalExpenses,
+        Balance: totals.balance,
       },
       { new: true }
     );
 
-    const oldBalance = oldEntry.Balance || 0;
-    const [day, month, year] = decodedDate.split("/");
-    const currentMonthStr = `${String(Number(month)).padStart(2, "0")}-${year}`;
-    const currentMonthReport = await MonthlyReport.findOne({ month: currentMonthStr });
-
-    if (currentMonthReport) {
-      currentMonthReport.netBalance = currentMonthReport.netBalance - oldBalance + balance;
-      currentMonthReport.closingBalance = currentMonthReport.openingBalance + currentMonthReport.netBalance;
-      await currentMonthReport.save();
-    }
+    markMonthlyReportsDirty(monthKeyFromPkrDateString(decodedDate));
+    await ensureMonthlyReportsUpToDate();
 
     return sendSuccess(res, { date: decodedDate, updatedEntry }, "Record updated");
   } catch (err) {
@@ -305,6 +791,427 @@ app.get("/logout", (req, res) => {
   return sendSuccess(res, { deprecated: true }, "Logged out");
 });
 
+app.get("/api/hr/overview", requireAdmin, async (req, res) => {
+  try {
+    const employees = await HrEmployee.find({}).sort({ createdAt: -1 });
+    const activeEmployees = employees.filter((employee) => (employee.employmentStatus || "active") !== "left");
+    const leftEmployees = employees.filter((employee) => (employee.employmentStatus || "active") === "left");
+    const employeeSummaries = activeEmployees.map((employee) => formatEmployeeSummary(employee));
+    const leftEmployeeSummaries = leftEmployees.map((employee) => formatLeftEmployeeSummary(employee));
+    const totals = employeeSummaries.reduce(
+      (acc, employee) => ({
+        totalEmployees: acc.totalEmployees + 1,
+        totalMonthlyPay: acc.totalMonthlyPay + Number(employee.monthlyPay || 0),
+        totalCurrentDue: acc.totalCurrentDue + Number(employee.currentDue || 0),
+        totalAdvances: acc.totalAdvances + Number(employee.advancesTotal || 0),
+        totalPaybacks: acc.totalPaybacks + Number(employee.paybacksTotal || 0),
+      }),
+      { totalEmployees: 0, totalMonthlyPay: 0, totalCurrentDue: 0, totalAdvances: 0, totalPaybacks: 0 },
+    );
+
+    return sendSuccess(res, {
+      employees: employeeSummaries,
+      leftEmployees: leftEmployeeSummaries,
+      totals,
+      date: curdate(),
+    }, "HR overview fetched");
+  } catch (err) {
+    console.error("Error fetching HR overview:", err);
+    return sendError(res, "Error fetching HR overview", 500);
+  }
+});
+
+app.post("/api/hr/employees", requireAdmin, async (req, res) => {
+  try {
+    const name = String(req.body.name || "").trim();
+    const monthlyPay = Number(req.body.monthlyPay || 0);
+    const joiningDate = parseDateToPKR(req.body.joiningDate || curdate());
+
+    if (!name) {
+      return sendError(res, "Employee name is required", 400);
+    }
+
+    if (!monthlyPay || monthlyPay <= 0) {
+      return sendError(res, "Monthly pay must be greater than zero", 400);
+    }
+
+    const employee = new HrEmployee({
+      name,
+      monthlyPay: roundMoney(monthlyPay),
+      joiningDate,
+      lastSettlementDate: joiningDate,
+      transactions: [],
+      settlements: [],
+      salaryAdjustments: [],
+    });
+
+    await employee.save();
+
+    return sendSuccess(res, { employee: formatEmployeeSummary(employee) }, "Employee added", 201);
+  } catch (err) {
+    console.error("Error creating HR employee:", err);
+    return sendError(res, "Error creating employee", 500);
+  }
+});
+
+app.get("/api/hr/employees/:id", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    const snapshot = getEmployeeSettlementSnapshot(employee);
+
+    return sendSuccess(res, {
+      employee: {
+        id: employee._id,
+        name: employee.name,
+        monthlyPay: employee.monthlyPay,
+        joiningDate: employee.joiningDate,
+        lastSettlementDate: employee.lastSettlementDate,
+        currentDue: snapshot.netPay,
+        netBalance: snapshot.netPay,
+        employmentStatus: employee.employmentStatus || "active",
+        leftDate: employee.leftDate || null,
+        payAtLeaving: employee.payAtLeaving || null,
+        netBalanceAtLeaving: Number(employee.netBalanceAtLeaving || 0),
+        transactions: employee.transactions || [],
+        settlements: employee.settlements || [],
+        salaryAdjustments: employee.salaryAdjustments || [],
+      },
+      snapshot,
+    }, "Employee fetched");
+  } catch (err) {
+    console.error("Error fetching HR employee:", err);
+    return sendError(res, "Error fetching employee", 500);
+  }
+});
+
+app.post("/api/hr/employees/:id/transactions", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "This employee has left and cannot receive transactions", 400);
+    }
+
+    const type = String(req.body.type || "").trim();
+    const amount = Number(req.body.amount || 0);
+    const note = String(req.body.note || "").trim();
+    const transactionDate = parseDateToPKR(req.body.transactionDate || curdate());
+
+    if (!["advance", "payback"].includes(type)) {
+      return sendError(res, "Transaction type must be advance or payback", 400);
+    }
+
+    if (!amount || amount <= 0) {
+      return sendError(res, "Transaction amount must be greater than zero", 400);
+    }
+
+    employee.transactions.push({
+      type,
+      amount: roundMoney(amount),
+      note,
+      transactionDate,
+      settledAt: null,
+    });
+
+    await employee.save();
+    const createdTransaction = employee.transactions[employee.transactions.length - 1];
+    await upsertHrTransactionIntoDailyRecord(employee, createdTransaction);
+    await ensureMonthlyReportsUpToDate();
+
+    return sendSuccess(res, {
+      employee: formatEmployeeSummary(employee),
+      transaction: createdTransaction,
+    }, "Transaction added", 201);
+  } catch (err) {
+    console.error("Error adding HR transaction:", err);
+    return sendError(res, "Error adding transaction", 500);
+  }
+});
+
+app.put("/api/hr/employees/:id/transactions/:transactionId", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "This employee has left and transactions cannot be edited", 400);
+    }
+
+    const transaction = (employee.transactions || []).id(req.params.transactionId);
+    if (!transaction) {
+      return sendError(res, "Transaction not found", 404);
+    }
+
+    if (transaction.settledAt) {
+      return sendError(res, "Settled transaction cannot be edited", 400);
+    }
+
+    const previousTransactionDate = transaction.transactionDate;
+    const type = String(req.body.type || transaction.type).trim();
+    const amount = Number(req.body.amount || 0);
+    const note = String(req.body.note || "").trim();
+    const transactionDate = parseDateToPKR(req.body.transactionDate || curdate());
+
+    if (![
+      "advance",
+      "payback",
+    ].includes(type)) {
+      return sendError(res, "Transaction type must be advance or payback", 400);
+    }
+
+    if (!amount || amount <= 0) {
+      return sendError(res, "Transaction amount must be greater than zero", 400);
+    }
+
+    transaction.type = type;
+    transaction.amount = roundMoney(amount);
+    transaction.note = note;
+    transaction.transactionDate = transactionDate;
+
+    await employee.save();
+    await removeHrTransactionFromDailyRecords(transaction._id, previousTransactionDate);
+    await upsertHrTransactionIntoDailyRecord(employee, transaction);
+    await ensureMonthlyReportsUpToDate();
+
+    return sendSuccess(res, {
+      employee: formatEmployeeSummary(employee),
+      transaction,
+    }, "Transaction updated");
+  } catch (err) {
+    console.error("Error updating HR transaction:", err);
+    return sendError(res, "Error updating transaction", 500);
+  }
+});
+
+app.post("/api/hr/employees/:id/increase-pay", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "This employee has left and cannot receive a pay increase", 400);
+    }
+
+    const increaseAmount = Number(req.body.increaseAmount || 0);
+    const note = String(req.body.note || "").trim();
+    const effectiveDate = parseDateToPKR(req.body.effectiveDate || curdate());
+
+    if (!increaseAmount || increaseAmount <= 0) {
+      return sendError(res, "Increase amount must be greater than zero", 400);
+    }
+
+    const previousPay = Number(employee.monthlyPay || 0);
+    const newMonthlyPay = roundMoney(previousPay + increaseAmount);
+
+    employee.monthlyPay = newMonthlyPay;
+    employee.salaryAdjustments.push({
+      previousPay,
+      increaseAmount: roundMoney(increaseAmount),
+      newMonthlyPay,
+      effectiveDate,
+      note,
+    });
+
+    await employee.save();
+
+    return sendSuccess(res, {
+      employee: formatEmployeeSummary(employee),
+      adjustment: employee.salaryAdjustments[employee.salaryAdjustments.length - 1],
+    }, "Pay increased", 201);
+  } catch (err) {
+    console.error("Error increasing employee pay:", err);
+    return sendError(res, "Error increasing employee pay", 500);
+  }
+});
+
+app.post("/api/hr/employees/:id/settlement-preview", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "This employee has left and cannot be settled again", 400);
+    }
+
+    const settlementDate = parseDateToPKR(req.body.settlementDate || curdate());
+    const settlementValidation = validateSettlementDateWindow(employee, settlementDate);
+    if (!settlementValidation.valid) {
+      return sendError(res, settlementValidation.message, 400, {
+        settlementDate,
+        lastSettlementDate: employee.lastSettlementDate || employee.joiningDate,
+        today: curdate(),
+      });
+    }
+    const snapshot = getEmployeeSettlementSnapshot(employee, settlementDate);
+
+    return sendSuccess(res, {
+      employee: {
+        id: employee._id,
+        name: employee.name,
+        monthlyPay: employee.monthlyPay,
+        joiningDate: employee.joiningDate,
+        lastSettlementDate: employee.lastSettlementDate,
+      },
+      snapshot,
+      transactions: snapshot.eligibleTransactions,
+    }, "Settlement preview created");
+  } catch (err) {
+    console.error("Error creating HR settlement preview:", err);
+    return sendError(res, "Error creating settlement preview", 500);
+  }
+});
+
+app.post("/api/hr/employees/:id/settle", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "This employee has left and cannot be settled again", 400);
+    }
+
+    const settlementDate = parseDateToPKR(req.body.settlementDate || curdate());
+    const settlementValidation = validateSettlementDateWindow(employee, settlementDate);
+    if (!settlementValidation.valid) {
+      return sendError(res, settlementValidation.message, 400, {
+        settlementDate,
+        lastSettlementDate: employee.lastSettlementDate || employee.joiningDate,
+        today: curdate(),
+      });
+    }
+    const snapshot = getEmployeeSettlementSnapshot(employee, settlementDate);
+    const netBalance = Number(snapshot.netPay || 0);
+
+    if (Math.abs(netBalance) > 0.000001) {
+      const dueType = netBalance > 0 ? "owner_due" : "employee_due";
+      const dueAmount = roundMoney(Math.abs(netBalance));
+      const dueMessage = netBalance > 0
+        ? `Not clear dues: owner has to pay ${dueAmount} PKR before settlement.`
+        : `Not clear dues: employee has to clear ${dueAmount} PKR before settlement.`;
+
+      return sendError(res, dueMessage, 400, {
+        netBalance,
+        dueType,
+        dueAmount,
+        settlementDate,
+      });
+    }
+
+    const settlementDoc = employee.settlements.create({
+      settlementDate,
+      daysWorked: snapshot.daysWorked,
+      dailyRate: snapshot.dailyRate,
+      basePay: snapshot.basePay,
+      advancesTotal: snapshot.advancesTotal,
+      paybacksTotal: snapshot.paybacksTotal,
+      netPay: snapshot.netPay,
+      transactionCount: snapshot.eligibleTransactions.length,
+      approvedAt: new Date(),
+      executedAt: new Date(),
+    });
+
+    employee.transactions = (employee.transactions || []).map((transaction) => {
+      const transactionYmd = pkrDateToYmd(transaction.transactionDate);
+      const startYmd = pkrDateToYmd(snapshot.lastSettlementDate);
+      const endYmd = pkrDateToYmd(settlementDate);
+      const inWindow = !transaction.settledAt && transactionYmd >= startYmd && transactionYmd <= endYmd;
+
+      if (inWindow) {
+        return {
+          ...transaction.toObject(),
+          settledAt: new Date(),
+          settlementId: settlementDoc._id,
+        };
+      }
+
+      return transaction;
+    });
+
+    employee.settlements.push(settlementDoc);
+    employee.lastSettlementDate = settlementDate;
+
+    await employee.save();
+
+    return sendSuccess(res, {
+      employee: formatEmployeeSummary(employee, settlementDate),
+      settlement: employee.settlements[employee.settlements.length - 1],
+    }, "Settlement executed", 201);
+  } catch (err) {
+    console.error("Error executing HR settlement:", err);
+    return sendError(res, "Error executing settlement", 500);
+  }
+});
+
+app.post("/api/hr/employees/:id/mark-left", requireAdmin, async (req, res) => {
+  try {
+    const employee = await HrEmployee.findById(req.params.id);
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "Employee is already marked as left", 400);
+    }
+
+    const leftDate = parseDateToPKR(req.body.leftDate || curdate());
+    const leftDateValidation = validateLeftDateWindow(employee, leftDate);
+    if (!leftDateValidation.valid) {
+      return sendError(res, leftDateValidation.message, 400, {
+        leftDate,
+        joiningDate: employee.joiningDate,
+        lastSettlementDate: employee.lastSettlementDate || employee.joiningDate,
+        today: curdate(),
+      });
+    }
+
+    const snapshot = getEmployeeSettlementSnapshot(employee, leftDate);
+    const netBalance = Number(snapshot.netPay || 0);
+    if (Math.abs(netBalance) > 0.000001) {
+      const dueType = netBalance > 0 ? "owner_due" : "employee_due";
+      const dueAmount = roundMoney(Math.abs(netBalance));
+      const dueMessage = netBalance > 0
+        ? `Not clear dues: owner has to pay ${dueAmount} PKR before marking employee as left.`
+        : `Not clear dues: employee has to clear ${dueAmount} PKR before marking employee as left.`;
+
+      return sendError(res, dueMessage, 400, {
+        netBalance,
+        dueType,
+        dueAmount,
+        settlementDate: leftDate,
+      });
+    }
+
+    employee.employmentStatus = "left";
+    employee.leftDate = leftDate;
+    employee.payAtLeaving = roundMoney(employee.monthlyPay);
+    employee.netBalanceAtLeaving = 0;
+
+    await employee.save();
+
+    return sendSuccess(res, {
+      employee: formatLeftEmployeeSummary(employee),
+    }, "Employee marked as left");
+  } catch (err) {
+    console.error("Error marking employee as left:", err);
+    return sendError(res, "Error marking employee as left", 500);
+  }
+});
+
 app.get(["/api/records", "/view"], requireAuth, async (req, res) => {
   try {
     const today = new Date();
@@ -396,74 +1303,59 @@ app.post(["/api/records", "/submit"], requireAdmin, async (req, res) => {
   const expensesArray = normalizeAmounts(req.body.expenses);
   const revenuesArray = normalizeAmounts(req.body.revenues);
 
-  const milkRevenue = (+morningMilk + +eveningMilk) * milkPrice;
-  const totalExpenses = expensesArray.reduce((sum, expense) => sum + expense.amount, 0);
-  const totalRevenue = revenuesArray.reduce((sum, revenue) => sum + revenue.amount, 0) + milkRevenue;
-  const balance = totalRevenue - totalExpenses;
-
   const selectedDate = req.body.recordDate;
   const currentDate = selectedDate || curdate();
 
   const existingSubmission = await Submission.findOne({ date: currentDate });
   if (existingSubmission) {
-    return sendError(res, `A record already exists for date ${currentDate}`, 409);
+    const existingExpenses = existingSubmission.expenses || [];
+    const existingRevenues = existingSubmission.revenues || [];
+    const hasManualExpenses = existingExpenses.some((item) => !isReadonlyDailyLineItem(item));
+    const hasManualRevenues = existingRevenues.some((item) => !isReadonlyDailyLineItem(item));
+    const hasManualMilk = Number(existingSubmission.morningMilkQuantity || 0) > 0
+      || Number(existingSubmission.eveningMilkQuantity || 0) > 0;
+
+    if (hasManualExpenses || hasManualRevenues || hasManualMilk) {
+      return sendError(res, `A record already exists for date ${currentDate}`, 409);
+    }
   }
 
-  const newSubmission = new Submission({
+  const currentMilkPrice = Number(existingSubmission?.milkPrice ?? milkPrice);
+  const manualExpenses = normalizeEditableLineItems(expensesArray);
+  const manualRevenues = normalizeEditableLineItems(revenuesArray);
+  const readonlyExpenses = normalizeReadonlyLineItems(existingSubmission?.expenses || []);
+  const readonlyRevenues = normalizeReadonlyLineItems(existingSubmission?.revenues || []);
+  const mergedExpenses = [...manualExpenses, ...readonlyExpenses];
+  const mergedRevenues = [...manualRevenues, ...readonlyRevenues];
+  const totals = calculateRecordTotals(morningMilk, eveningMilk, currentMilkPrice, mergedExpenses, mergedRevenues);
+
+  const submissionPayload = {
     date: currentDate,
-    morningMilkQuantity: morningMilk,
-    eveningMilkQuantity: eveningMilk,
-    milkPrice,
-    expenses: expensesArray,
-    revenues: revenuesArray,
-    totalRevenue,
-    totalExpenditure: totalExpenses,
-    Balance: balance,
-  });
-
-  const [day, month, year] = currentDate.split("/");
-  const entryDateObj = new Date(year, month - 1, day);
-  const currentMonth = entryDateObj.getMonth() + 1;
-  const currentYear = entryDateObj.getFullYear();
-  const currentMonthStr = `${String(currentMonth).padStart(2, "0")}-${currentYear}`;
-
-  const previousMonthStr = currentMonth === 1
-    ? `12-${currentYear - 1}`
-    : `${String(currentMonth - 1).padStart(2, "0")}-${currentYear}`;
-
-  const previousMonthReport = await MonthlyReport.findOne({ month: previousMonthStr });
-  const previousMonthClosingBalance = previousMonthReport ? previousMonthReport.closingBalance : 0;
-
-  let currentMonthReport = await MonthlyReport.findOne({ month: currentMonthStr });
-
-  const options = { day: "2-digit", month: "2-digit", year: "numeric" };
-  const startDate = new Date(currentYear, currentMonth - 1, 1);
-  const endDate = new Date(currentYear, currentMonth, 0);
-
-  const startDateFormatted = startDate.toLocaleDateString("en-GB", options);
-  const endDateFormatted = endDate.toLocaleDateString("en-GB", options);
-
-  if (!currentMonthReport) {
-    currentMonthReport = new MonthlyReport({
-      month: currentMonthStr,
-      openingBalance: previousMonthClosingBalance,
-      netBalance: balance,
-      closingBalance: previousMonthClosingBalance + balance,
-      startDate: startDateFormatted,
-      endDate: endDateFormatted,
-    });
-  } else {
-    currentMonthReport.netBalance += balance;
-    currentMonthReport.closingBalance = currentMonthReport.openingBalance + currentMonthReport.netBalance;
-  }
+    morningMilkQuantity: Number(morningMilk || 0),
+    eveningMilkQuantity: Number(eveningMilk || 0),
+    milkPrice: currentMilkPrice,
+    expenses: mergedExpenses,
+    revenues: mergedRevenues,
+    totalRevenue: totals.totalRevenue,
+    totalExpenditure: totals.totalExpenses,
+    Balance: totals.balance,
+  };
 
   try {
-    await currentMonthReport.save();
-    await newSubmission.save();
+    let savedSubmission;
+    if (existingSubmission) {
+      savedSubmission = await Submission.findOneAndUpdate({ date: currentDate }, submissionPayload, { new: true });
+    } else {
+      const newSubmission = new Submission(submissionPayload);
+      savedSubmission = await newSubmission.save();
+    }
+
+    markMonthlyReportsDirty(monthKeyFromPkrDateString(currentDate));
+    await ensureMonthlyReportsUpToDate();
 
     return sendSuccess(res, {
       date: currentDate,
-      submission: newSubmission,
+      submission: savedSubmission,
     }, "Record inserted", 201);
   } catch (error) {
     console.error("Error submitting form:", error);
@@ -540,6 +1432,7 @@ app.post("/update/:date", requireAdmin, async (req, res) => {
 
 app.get(["/api/reports/months", "/getmonths"], requireAuth, async (req, res) => {
   try {
+    await ensureMonthlyReportsUpToDate();
     const months = await MonthlyReport.find();
     const formattedMonths = months.map((month) => formatMonth(month.month));
 
@@ -574,6 +1467,7 @@ app.get(["/api/reports/:month", "/getrep/:month"], requireAuth, async (req, res)
   const formattedEndDate = formatDateToYMD(endDate);
 
   try {
+    await ensureMonthlyReportsUpToDate();
     const records = await Submission.find({});
     const filteredRecords = records.filter((record) => {
       const [day, dbMonth, dbYear] = record.date.split("/");

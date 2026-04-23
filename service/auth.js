@@ -9,6 +9,8 @@ const setUser = (user) => {
         tenantId: user.tenantId || null,
         tenantCode: user.tenantCode || null,
         tenantName: user.tenantName || null,
+        tenantIsActive: typeof user.tenantIsActive === "boolean" ? user.tenantIsActive : null,
+        tenantSubscriptionExpiresAt: user.tenantSubscriptionExpiresAt || null,
     } , process.env.SECRET_KEY);
 }
 

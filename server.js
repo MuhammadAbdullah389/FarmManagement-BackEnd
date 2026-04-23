@@ -511,6 +511,8 @@ function userPayload(user) {
     tenantId: user.tenantId,
     tenantCode: user.tenantCode,
     tenantName: user.tenantName || null,
+    tenantIsActive: typeof user.tenantIsActive === "boolean" ? user.tenantIsActive : null,
+    tenantSubscriptionExpiresAt: user.tenantSubscriptionExpiresAt || null,
   };
 }
 
@@ -520,14 +522,14 @@ function getTenantStatus(tenant) {
   }
 
   const now = new Date();
-  const untilDate = tenant.inactiveUntil ? new Date(tenant.inactiveUntil) : null;
-  const shouldReactivate = !tenant.isActive && untilDate && untilDate.getTime() <= now.getTime();
-  const isActiveNow = Boolean(tenant.isActive || shouldReactivate);
+  const expiresAt = tenant.inactiveUntil ? new Date(tenant.inactiveUntil) : null;
+  const isExpired = Boolean(expiresAt && expiresAt.getTime() <= now.getTime());
+  const isActiveNow = Boolean(tenant.isActive && !isExpired);
 
   return {
     isActiveNow,
-    shouldReactivate,
-    inactiveUntil: untilDate,
+    isExpired,
+    inactiveUntil: expiresAt,
   };
 }
 
@@ -547,9 +549,8 @@ async function ensureTenantIsActive(req, res) {
 
   const status = getTenantStatus(tenant);
 
-  if (tenant && status.shouldReactivate) {
-    tenant.isActive = true;
-    tenant.inactiveUntil = null;
+  if (tenant && status.isExpired && tenant.isActive) {
+    tenant.isActive = false;
     await tenant.save();
   }
 
@@ -565,22 +566,12 @@ async function requireAuth(req, res, next) {
     return sendError(res, "Authentication required", 401);
   }
 
-  const tenantCheck = await ensureTenantIsActive(req, res);
-  if (!tenantCheck.ok) {
-    return tenantCheck.response;
-  }
-
   return next();
 }
 
 async function requireAdmin(req, res, next) {
   if (!req.user) {
     return sendError(res, "Authentication required", 401);
-  }
-
-  const tenantCheck = await ensureTenantIsActive(req, res);
-  if (!tenantCheck.ok) {
-    return tenantCheck.response;
   }
 
   if (!["admin", "superadmin"].includes(req.user.role)) {
@@ -593,11 +584,6 @@ async function requireAdmin(req, res, next) {
 async function requireSuperadmin(req, res, next) {
   if (!req.user) {
     return sendError(res, "Authentication required", 401);
-  }
-
-  const tenantCheck = await ensureTenantIsActive(req, res);
-  if (!tenantCheck.ok) {
-    return tenantCheck.response;
   }
 
   if (req.user.role !== "superadmin") {
@@ -954,14 +940,8 @@ app.post(["/api/auth/login", "/login"], async (req, res) => {
   const tenant = await Tenant.findOne({ code: normalizedTenantCode });
   const tenantStatus = getTenantStatus(tenant);
 
-  if (!tenant || !tenantStatus.isActiveNow) {
+  if (!tenant) {
     return sendError(res, "Tenant is invalid or inactive", 401);
-  }
-
-  if (tenantStatus.shouldReactivate) {
-    tenant.isActive = true;
-    tenant.inactiveUntil = null;
-    await tenant.save();
   }
 
   const user = await verifyUser(normalizedEmail, password, tenant);
@@ -975,6 +955,8 @@ app.post(["/api/auth/login", "/login"], async (req, res) => {
     tenantId: tenant._id,
     tenantCode: tenant.code,
     tenantName: tenant.name,
+    tenantIsActive: Boolean(tenantStatus.isActiveNow),
+    tenantSubscriptionExpiresAt: tenant.inactiveUntil || null,
   });
   const oneMonth = 30 * 24 * 60 * 60 * 1000;
   const isProd = process.env.NODE_ENV === "production";
@@ -993,6 +975,8 @@ app.post(["/api/auth/login", "/login"], async (req, res) => {
         tenantId: tenant._id,
         tenantCode: tenant.code,
         tenantName: tenant.name,
+        tenantIsActive: Boolean(tenantStatus.isActiveNow),
+        tenantSubscriptionExpiresAt: tenant.inactiveUntil || null,
       }),
     },
   }, "Login successful");
@@ -1002,6 +986,122 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
   return sendSuccess(res, {
     user: userPayload(req.user),
   }, "Authenticated user fetched");
+});
+
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const tenantScope = getRequestTenantScope(req);
+    if (!tenantScope) {
+      return sendError(res, "Tenant context missing. Please sign in again.", 401);
+    }
+
+    const users = await User.find({
+      ...addTenantScope({}, tenantScope),
+      role: { $ne: "superadmin" },
+    }).sort({ createdAt: -1 });
+    return sendSuccess(res, {
+      users: users.map((user) => ({
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+      })),
+    }, "Tenant users fetched");
+  } catch (err) {
+    console.error("Error fetching tenant users:", err);
+    return sendError(res, "Unable to fetch tenant users", 500);
+  }
+});
+
+app.post("/api/admin/users", requireAdmin, async (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+  const role = String(req.body.role || "user").trim();
+
+  if (!name || !email || !password) {
+    return sendError(res, "Name, email, and password are required", 400);
+  }
+
+  if (!["user", "admin"].includes(role)) {
+    return sendError(res, "Role must be user or admin", 400);
+  }
+
+  const tenantScope = getRequestTenantScope(req);
+  if (!tenantScope) {
+    return sendError(res, "Tenant context missing. Please sign in again.", 401);
+  }
+
+  try {
+    const existingUser = await User.findOne({
+      email,
+      tenantCode: tenantScope.tenantCode,
+    }).lean();
+
+    if (existingUser) {
+      return sendError(res, "User already exists in this tenant", 409);
+    }
+
+    const createdUser = await User.create({
+      name,
+      email,
+      password,
+      role,
+      tenantId: tenantScope.tenantId,
+      tenantCode: tenantScope.tenantCode,
+    });
+
+    return sendSuccess(res, {
+      user: {
+        id: createdUser._id,
+        name: createdUser.name,
+        email: createdUser.email,
+        role: createdUser.role,
+        createdAt: createdUser.createdAt,
+        updatedAt: createdUser.updatedAt,
+      },
+    }, "Tenant user created", 201);
+  } catch (err) {
+    console.error("Error creating tenant user:", err);
+    return sendError(res, "Unable to create tenant user", 500);
+  }
+});
+
+app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const tenantScope = getRequestTenantScope(req);
+    if (!tenantScope) {
+      return sendError(res, "Tenant context missing. Please sign in again.", 401);
+    }
+
+    const user = await User.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
+    if (!user) {
+      return sendError(res, "User not found", 404);
+    }
+
+    if (user.role === "superadmin") {
+      return sendError(res, "Superadmin users cannot be deleted from tenant settings", 400);
+    }
+
+    if (String(user._id) === String(req.user._id)) {
+      return sendError(res, "You cannot delete your own account", 400);
+    }
+
+    if (user.role === "admin") {
+      const remainingAdmins = await User.countDocuments(addTenantScope({ role: "admin" }, tenantScope));
+      if (remainingAdmins <= 1) {
+        return sendError(res, "At least one admin must remain in the tenant", 400);
+      }
+    }
+
+    await User.deleteOne({ _id: user._id });
+    return sendSuccess(res, null, "Tenant user deleted");
+  } catch (err) {
+    console.error("Error deleting tenant user:", err);
+    return sendError(res, "Unable to delete tenant user", 500);
+  }
 });
 
 app.post("/api/auth/logout", (req, res) => {
@@ -1219,6 +1319,43 @@ app.put("/api/hr/employees/:id/transactions/:transactionId", requireAdmin, async
   } catch (err) {
     console.error("Error updating HR transaction:", err);
     return sendError(res, "Error updating transaction", 500);
+  }
+});
+
+app.delete("/api/hr/employees/:id/transactions/:transactionId", requireAdmin, async (req, res) => {
+  try {
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
+    if (!employee) {
+      return sendError(res, "Employee not found", 404);
+    }
+
+    if ((employee.employmentStatus || "active") === "left") {
+      return sendError(res, "This employee has left and transactions cannot be deleted", 400);
+    }
+
+    const transaction = (employee.transactions || []).id(req.params.transactionId);
+    if (!transaction) {
+      return sendError(res, "Transaction not found", 404);
+    }
+
+    if (transaction.settledAt) {
+      return sendError(res, "Settled transaction cannot be deleted", 400);
+    }
+
+    const transactionDate = transaction.transactionDate;
+    transaction.deleteOne();
+
+    await employee.save();
+    await removeHrTransactionFromDailyRecords(transaction._id, tenantScope, transactionDate);
+    await ensureMonthlyReportsUpToDate(tenantScope);
+
+    return sendSuccess(res, {
+      employee: formatEmployeeSummary(employee),
+    }, "Transaction deleted");
+  } catch (err) {
+    console.error("Error deleting HR transaction:", err);
+    return sendError(res, "Error deleting transaction", 500);
   }
 });
 
@@ -1765,12 +1902,6 @@ app.get("/api/superadmin/farms", requireSuperadmin, async (req, res) => {
     for (const tenant of tenants) {
       const status = getTenantStatus(tenant);
 
-      if (status.shouldReactivate) {
-        tenant.isActive = true;
-        tenant.inactiveUntil = null;
-        await tenant.save();
-      }
-
       farms.push({
         id: tenant._id,
         name: tenant.name,
@@ -1857,7 +1988,7 @@ app.patch("/api/superadmin/farms/:id/status", requireSuperadmin, async (req, res
       req.params.id,
       {
         isActive,
-        inactiveUntil: isActive ? null : inactiveUntil,
+        inactiveUntil: isActive ? inactiveUntil : null,
       },
       { new: true },
     );

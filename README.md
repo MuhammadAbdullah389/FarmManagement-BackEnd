@@ -5,26 +5,17 @@ API-only backend for Advanced FMS. It serves JSON responses, uses cookie-based J
 ## Highlights
 
 - Cookie auth with `tId` (httpOnly)
-- Role-based access (`user`, `admin`)
+- Role-based access (`user`, `admin`, `superadmin`)
 - Daily record create/update with month-aware validation
 - Monthly report summaries (`opening`, `net`, `closing`)
 - HR module: employees, transactions, settlement preview/execute, mark-left
 - HR transaction sync into daily records as readonly line items
+- HR transaction delete sync for unsettled entries
 - Monthly consistency logic with incremental rebuild from dirty month
-
-## Insights Snapshot
-
-- Total route declarations in `server.js`: 27
-- Total route bindings including legacy aliases: 38
-- Canonical `/api/*` routes: 21
-- Public route declarations: 5
-- Auth-protected route declarations: 7
-- Admin-protected route declarations: 15
-
-Notes:
-
-- Counts above include legacy compatibility aliases where present.
-- Role counts are based on route middleware usage (`requireAuth`, `requireAdmin`).
+- Tenant-aware auth and data scoping through `tenantId` / `tenantCode`
+- Tenant subscription state stored with `isActive` and `inactiveUntil`
+- Superadmin farm lifecycle APIs for list, create, toggle, delete, and overview
+- Admin user management APIs for listing, creating, and deleting tenant users
 
 ## Tech Stack
 
@@ -55,6 +46,7 @@ Notes:
 - Fetch: `credentials: "include"`
 - Axios: `withCredentials: true`
 - CORS allow-list is derived from `FRONTEND_ORIGIN`
+- Superadmin and admin checks are enforced by route middleware in `server.js`
 
 ## Common Response Envelope
 
@@ -112,6 +104,21 @@ Readonly HR-synced line items are preserved by backend during daily record updat
 
 Only unsettled HR transactions can be edited.
 
+Unsettled transactions can also be deleted. Delete removes the transaction from the employee, removes its synced readonly line from the daily record, and marks the affected month dirty for rebuild.
+
+### Tenant Subscription
+
+- Tenant status is stored on the tenant document with `isActive` and `inactiveUntil`
+- Superadmin activates a farm with a calendar date/time expiry
+- Farm admins can still log in when inactive; the frontend redirects them to a locked subscription-expired page
+- Deleting or toggling a farm happens through the `/api/superadmin/farms` endpoints
+
+### Admin Users
+
+- Tenant admins can list users for their farm
+- Tenant admins can create and delete users for their farm
+- Superadmin accounts are filtered out of the tenant user list and cannot be deleted from tenant settings
+
 ## API Endpoints
 
 ### Health And Auth
@@ -122,6 +129,14 @@ Only unsettled HR transactions can be edited.
 | POST | /api/auth/login | Public | Login and set cookie |
 | GET | /api/auth/me | Auth | Current user |
 | POST | /api/auth/logout | Public | Logout |
+
+### Admin Users
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| GET | /api/admin/users | Admin | List tenant users |
+| POST | /api/admin/users | Admin | Create tenant user |
+| DELETE | /api/admin/users/:id | Admin | Delete tenant user |
 
 ### Dashboard
 
@@ -159,10 +174,22 @@ Request body for create/update still uses map-style `expenses` and `revenues` ob
 | GET | /api/hr/employees/:id | Admin | Employee detail |
 | POST | /api/hr/employees/:id/transactions | Admin | Add advance/payback |
 | PUT | /api/hr/employees/:id/transactions/:transactionId | Admin | Edit unsettled transaction |
+| DELETE | /api/hr/employees/:id/transactions/:transactionId | Admin | Delete unsettled transaction |
 | POST | /api/hr/employees/:id/increase-pay | Admin | Increase salary |
 | POST | /api/hr/employees/:id/settlement-preview | Admin | Settlement preview |
 | POST | /api/hr/employees/:id/settle | Admin | Execute settlement |
 | POST | /api/hr/employees/:id/mark-left | Admin | Mark employee left |
+
+### Superadmin Farms
+
+| Method | Path | Access | Purpose |
+| --- | --- | --- | --- |
+| GET | /api/superadmin/farms | Superadmin | List farm tenants |
+| POST | /api/superadmin/farms | Superadmin | Create a farm tenant and admin |
+| PATCH | /api/superadmin/farms/:id/status | Superadmin | Toggle farm active state |
+| DELETE | /api/superadmin/farms/:id | Superadmin | Delete a farm tenant |
+| GET | /api/superadmin/report | Superadmin | Platform summary report |
+| GET | /api/superadmin/farms/:code/overview | Superadmin | View a farm overview |
 
 ## HR To Daily Record Sync Behavior
 
@@ -171,7 +198,8 @@ Implemented behavior:
 1. HR advance creates/updates a readonly expense line in daily record.
 2. HR payback creates/updates a readonly revenue line in daily record.
 3. Editing an unsettled HR transaction updates its linked readonly daily line, including date/type/amount/note changes.
-4. Daily record edit endpoints cannot overwrite HR readonly lines.
+4. Deleting an unsettled HR transaction removes its linked readonly daily line from the daily record.
+5. Daily record edit endpoints cannot overwrite HR readonly lines.
 
 Generated description pattern:
 
@@ -223,3 +251,4 @@ node server.js
 - Daily dates are stored as `dd/mm/yyyy`.
 - Report month supports `MM-YYYY` and `Month YYYY`.
 - Daily record responses may include readonly HR line items with metadata.
+- Inactive tenants are not hard-blocked at login; the frontend handles the expired-subscription gate.

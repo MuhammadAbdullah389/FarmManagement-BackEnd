@@ -8,7 +8,6 @@ const userSchema = new mongoose.Schema({
     email : {
         type : String,
         required : true,
-        unique : true,
     },
     password : {
         type : String,
@@ -17,10 +16,23 @@ const userSchema = new mongoose.Schema({
     role : {
         type : String,
         required : true,
-        enum : ["user", "admin"],
+        enum : ["user", "admin", "superadmin"],
         default : "user"
-    }
+    },
+    tenantId: {
+        type: mongoose.Schema.Types.ObjectId,
+        default: null,
+        index: true,
+    },
+    tenantCode: {
+        type: String,
+        default: null,
+        uppercase: true,
+        trim: true,
+    },
 });
+
+userSchema.index({ email: 1, tenantCode: 1 }, { unique: true, sparse: true });
 
 const User = mongoose.model("UserLogs" , userSchema);
 

@@ -6,6 +6,9 @@ const setUser = (user) => {
         name : user.name,
         email : user.email,
         role : user.role,
+        tenantId: user.tenantId || null,
+        tenantCode: user.tenantCode || null,
+        tenantName: user.tenantName || null,
     } , process.env.SECRET_KEY);
 }
 

@@ -28,10 +28,20 @@ const lineItemSchema = new mongoose.Schema({
 }, { _id: false });
 
 const submissionSchema = new mongoose.Schema({
+    tenantId: {
+        type: mongoose.Schema.Types.ObjectId,
+        required: true,
+        index: true,
+    },
+    tenantCode: {
+        type: String,
+        required: true,
+        uppercase: true,
+        trim: true,
+    },
     date: { 
         type: String, 
-        required: true, 
-        unique: true 
+        required: true
     },
     morningMilkQuantity: { 
         type: Number, 
@@ -64,6 +74,8 @@ const submissionSchema = new mongoose.Schema({
     timestamps: true,
 }
 );
+
+submissionSchema.index({ tenantId: 1, date: 1 }, { unique: true });
 
 const Submission = mongoose.model('Submission', submissionSchema);
 

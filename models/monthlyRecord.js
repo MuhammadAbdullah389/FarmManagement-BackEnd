@@ -1,10 +1,20 @@
 const mongoose = require('mongoose');
 
 const monthlyReportSchema = new mongoose.Schema({
+  tenantId: {
+    type: mongoose.Schema.Types.ObjectId,
+    required: true,
+    index: true,
+  },
+  tenantCode: {
+    type: String,
+    required: true,
+    uppercase: true,
+    trim: true,
+  },
   month: {
     type: String,
     required: true,
-    unique: true, 
   },
 
   openingBalance: {
@@ -38,6 +48,8 @@ const monthlyReportSchema = new mongoose.Schema({
   }
 
 });
+
+monthlyReportSchema.index({ tenantId: 1, month: 1 }, { unique: true });
 
 const MonthlyReport = mongoose.model('MonthlyReport', monthlyReportSchema);
 

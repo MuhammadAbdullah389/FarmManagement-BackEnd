@@ -7,6 +7,8 @@ const curdate = require("./controllers/currentdate");
 const Submission = require("./models/dailyRecord");
 const MonthlyReport = require("./models/monthlyRecord");
 const HrEmployee = require("./models/hrEmployee");
+const User = require("./models/users");
+const Tenant = require("./models/tenant");
 const { verifyUser } = require("./controllers/verifyUser");
 const { setUser, getUser } = require("./service/auth");
 
@@ -94,7 +96,58 @@ function compareMonthKeys(a, b) {
   return aParsed.month - bParsed.month;
 }
 
-let monthlyReportsDirtyFromMonth = null;
+const TENANT_CODE_REGEX = /^(ALPHA|BETA|CHARLIE|DELTA)-\d{3}$/;
+const monthlyReportsDirtyByTenant = new Map();
+
+function normalizeTenantCode(rawCode) {
+  const normalized = String(rawCode || "").trim().toUpperCase();
+  return TENANT_CODE_REGEX.test(normalized) ? normalized : null;
+}
+
+function parseTenantIdentifier(prefix, codeNumber) {
+  const normalizedPrefix = String(prefix || "").trim().toUpperCase();
+  const numeric = Number(String(codeNumber || "").replace(/\D/g, ""));
+  if (!Number.isInteger(numeric) || numeric < 1 || numeric > 999) {
+    return null;
+  }
+
+  return normalizeTenantCode(`${normalizedPrefix}-${String(numeric).padStart(3, "0")}`);
+}
+
+function normalizeTenantIdentifierInput(tenantIdentifier, tenantPrefix, tenantCodeNumber) {
+  const explicitCode = normalizeTenantCode(tenantIdentifier);
+  if (explicitCode) {
+    return explicitCode;
+  }
+
+  return parseTenantIdentifier(tenantPrefix, tenantCodeNumber);
+}
+
+function getTenantScope(source) {
+  if (!source?.tenantId || !source?.tenantCode) {
+    return null;
+  }
+
+  return {
+    tenantId: source.tenantId,
+    tenantCode: source.tenantCode,
+  };
+}
+
+function addTenantScope(query = {}, tenantScope) {
+  if (!tenantScope) {
+    return {
+      ...query,
+      tenantCode: "__NO_TENANT_SCOPE__",
+    };
+  }
+
+  return {
+    ...query,
+    tenantId: tenantScope.tenantId,
+    tenantCode: tenantScope.tenantCode,
+  };
+}
 
 function monthKeyFromPkrDateString(dateValue) {
   const dateObj = parsePkrDateToObject(dateValue);
@@ -104,18 +157,21 @@ function monthKeyFromPkrDateString(dateValue) {
   return monthKeyFromDate(dateObj);
 }
 
-function markMonthlyReportsDirty(monthKey) {
-  if (!monthKey) {
+function markMonthlyReportsDirty(monthKey, tenantScope) {
+  if (!monthKey || !tenantScope?.tenantId) {
     return;
   }
 
-  if (!monthlyReportsDirtyFromMonth || compareMonthKeys(monthKey, monthlyReportsDirtyFromMonth) < 0) {
-    monthlyReportsDirtyFromMonth = monthKey;
+  const tenantKey = String(tenantScope.tenantId);
+  const currentDirtyMonth = monthlyReportsDirtyByTenant.get(tenantKey) || null;
+
+  if (!currentDirtyMonth || compareMonthKeys(monthKey, currentDirtyMonth) < 0) {
+    monthlyReportsDirtyByTenant.set(tenantKey, monthKey);
   }
 }
 
-async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
-  const submissions = await Submission.find({}, { date: 1, Balance: 1 }).lean();
+async function rebuildMonthlyReportsFromMonth(tenantScope, fromMonthKey = null) {
+  const submissions = await Submission.find(addTenantScope({}, tenantScope), { date: 1, Balance: 1 }).lean();
   const netByMonth = new Map();
 
   submissions.forEach((entry) => {
@@ -132,7 +188,7 @@ async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
   const sortedMonths = Array.from(netByMonth.keys()).sort(compareMonthKeys);
 
   if (sortedMonths.length === 0) {
-    await MonthlyReport.deleteMany({});
+    await MonthlyReport.deleteMany(addTenantScope({}, tenantScope));
     return;
   }
 
@@ -140,7 +196,7 @@ async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
   const monthsToRebuild = sortedMonths.filter((monthKey) => compareMonthKeys(monthKey, effectiveFromMonth) >= 0);
 
   if (monthsToRebuild.length === 0) {
-    const storedReports = await MonthlyReport.find({}, { _id: 1, month: 1 }).lean();
+    const storedReports = await MonthlyReport.find(addTenantScope({}, tenantScope), { _id: 1, month: 1 }).lean();
     const staleIds = storedReports
       .filter((report) => compareMonthKeys(report.month, effectiveFromMonth) >= 0)
       .map((report) => report._id);
@@ -158,7 +214,7 @@ async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
     .slice(-1)[0];
 
   if (previousMonth) {
-    const previousReport = await MonthlyReport.findOne({ month: previousMonth }, { closingBalance: 1 }).lean();
+    const previousReport = await MonthlyReport.findOne(addTenantScope({ month: previousMonth }, tenantScope), { closingBalance: 1 }).lean();
     previousClosingBalance = Number(previousReport?.closingBalance || 0);
   }
 
@@ -171,9 +227,11 @@ async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
     const closingBalance = roundMoney(openingBalance + netBalance);
 
     await MonthlyReport.updateOne(
-      { month: monthKey },
+      addTenantScope({ month: monthKey }, tenantScope),
       {
         $set: {
+          tenantId: tenantScope.tenantId,
+          tenantCode: tenantScope.tenantCode,
           openingBalance,
           netBalance,
           closingBalance,
@@ -187,7 +245,7 @@ async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
     previousClosingBalance = closingBalance;
   }
 
-  const storedReports = await MonthlyReport.find({}, { _id: 1, month: 1 }).lean();
+  const storedReports = await MonthlyReport.find(addTenantScope({}, tenantScope), { _id: 1, month: 1 }).lean();
   const staleIds = storedReports
     .filter((report) => compareMonthKeys(report.month, monthsToRebuild[0]) >= 0 && !netByMonth.has(report.month))
     .map((report) => report._id);
@@ -197,14 +255,20 @@ async function rebuildMonthlyReportsFromMonth(fromMonthKey = null) {
   }
 }
 
-async function ensureMonthlyReportsUpToDate() {
-  if (!monthlyReportsDirtyFromMonth) {
+async function ensureMonthlyReportsUpToDate(tenantScope) {
+  const scope = getTenantScope(tenantScope);
+  if (!scope) {
     return;
   }
 
-  const fromMonth = monthlyReportsDirtyFromMonth;
-  await rebuildMonthlyReportsFromMonth(fromMonth);
-  monthlyReportsDirtyFromMonth = null;
+  const tenantKey = String(scope.tenantId);
+  const dirtyMonth = monthlyReportsDirtyByTenant.get(tenantKey);
+  if (!dirtyMonth) {
+    return;
+  }
+
+  await rebuildMonthlyReportsFromMonth(scope, dirtyMonth);
+  monthlyReportsDirtyByTenant.delete(tenantKey);
 }
 
 function isCurrentMonthDate(ddmmyyyy) {
@@ -434,20 +498,112 @@ function deriveUser(req, res, next) {
   next();
 }
 
-function requireAuth(req, res, next) {
+function getRequestTenantScope(req) {
+  return getTenantScope(req?.user);
+}
+
+function userPayload(user) {
+  return {
+    id: user._id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    tenantId: user.tenantId,
+    tenantCode: user.tenantCode,
+    tenantName: user.tenantName || null,
+  };
+}
+
+function getTenantStatus(tenant) {
+  if (!tenant) {
+    return { isActiveNow: false };
+  }
+
+  const now = new Date();
+  const untilDate = tenant.inactiveUntil ? new Date(tenant.inactiveUntil) : null;
+  const shouldReactivate = !tenant.isActive && untilDate && untilDate.getTime() <= now.getTime();
+  const isActiveNow = Boolean(tenant.isActive || shouldReactivate);
+
+  return {
+    isActiveNow,
+    shouldReactivate,
+    inactiveUntil: untilDate,
+  };
+}
+
+async function ensureTenantIsActive(req, res) {
+  if (req.user.role === "superadmin" && (!req.user?.tenantId || !req.user?.tenantCode)) {
+    return { ok: true };
+  }
+
+  if (!req.user?.tenantId || !req.user?.tenantCode) {
+    return { ok: false, response: sendError(res, "Tenant context missing. Please sign in again.", 401) };
+  }
+
+  const tenant = await Tenant.findOne({
+    _id: req.user.tenantId,
+    code: req.user.tenantCode,
+  });
+
+  const status = getTenantStatus(tenant);
+
+  if (tenant && status.shouldReactivate) {
+    tenant.isActive = true;
+    tenant.inactiveUntil = null;
+    await tenant.save();
+  }
+
+  if (!tenant || !status.isActiveNow) {
+    return { ok: false, response: sendError(res, "Your tenant is inactive. Contact superadmin.", 403) };
+  }
+
+  return { ok: true };
+}
+
+async function requireAuth(req, res, next) {
   if (!req.user) {
     return sendError(res, "Authentication required", 401);
   }
+
+  const tenantCheck = await ensureTenantIsActive(req, res);
+  if (!tenantCheck.ok) {
+    return tenantCheck.response;
+  }
+
   return next();
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
   if (!req.user) {
     return sendError(res, "Authentication required", 401);
   }
-  if (req.user.role !== "admin") {
-    return sendError(res, "Admin access required", 403);
+
+  const tenantCheck = await ensureTenantIsActive(req, res);
+  if (!tenantCheck.ok) {
+    return tenantCheck.response;
   }
+
+  if (!["admin", "superadmin"].includes(req.user.role)) {
+    return sendError(res, "Admin or superadmin access required", 403);
+  }
+
+  return next();
+}
+
+async function requireSuperadmin(req, res, next) {
+  if (!req.user) {
+    return sendError(res, "Authentication required", 401);
+  }
+
+  const tenantCheck = await ensureTenantIsActive(req, res);
+  if (!tenantCheck.ok) {
+    return tenantCheck.response;
+  }
+
+  if (req.user.role !== "superadmin") {
+    return sendError(res, "Superadmin access required", 403);
+  }
+
   return next();
 }
 
@@ -541,7 +697,7 @@ function buildHrDailyLineItem(employee, transaction) {
   };
 }
 
-async function removeHrTransactionFromDailyRecords(transactionId, dateHint = null) {
+async function removeHrTransactionFromDailyRecords(transactionId, tenantScope, dateHint = null) {
   const refId = String(transactionId);
   const baseQuery = {
     $or: [
@@ -550,7 +706,8 @@ async function removeHrTransactionFromDailyRecords(transactionId, dateHint = nul
     ],
   };
   const query = dateHint ? { ...baseQuery, date: dateHint } : baseQuery;
-  const records = await Submission.find(query);
+  const scopedQuery = addTenantScope(query, tenantScope);
+  const records = await Submission.find(scopedQuery);
 
   for (const record of records) {
     const nextExpenses = (record.expenses || []).filter((item) => String(item.sourceRefId || "") !== refId);
@@ -576,17 +733,24 @@ async function removeHrTransactionFromDailyRecords(transactionId, dateHint = nul
     record.totalExpenditure = totals.totalExpenses;
     record.Balance = totals.balance;
     await record.save();
-    markMonthlyReportsDirty(monthKeyFromPkrDateString(record.date));
+    markMonthlyReportsDirty(monthKeyFromPkrDateString(record.date), tenantScope);
   }
 }
 
 async function upsertHrTransactionIntoDailyRecord(employee, transaction) {
+  const tenantScope = getTenantScope(employee);
+  if (!tenantScope) {
+    throw new Error("Employee tenant context is missing");
+  }
+
   const transactionDate = parseDateToPKR(transaction.transactionDate || curdate());
-  let record = await Submission.findOne({ date: transactionDate });
+  let record = await Submission.findOne(addTenantScope({ date: transactionDate }, tenantScope));
 
   if (!record) {
     const milkRate = Number(milkPrice || 0);
     record = new Submission({
+      tenantId: tenantScope.tenantId,
+      tenantCode: tenantScope.tenantCode,
       date: transactionDate,
       morningMilkQuantity: 0,
       eveningMilkQuantity: 0,
@@ -618,16 +782,17 @@ async function upsertHrTransactionIntoDailyRecord(employee, transaction) {
   record.totalExpenditure = totals.totalExpenses;
   record.Balance = totals.balance;
   await record.save();
-  markMonthlyReportsDirty(monthKeyFromPkrDateString(transactionDate));
+  markMonthlyReportsDirty(monthKeyFromPkrDateString(transactionDate), tenantScope);
 }
 
 async function updateRecordHandler(req, res, decodedDate) {
   const { morningMilk, eveningMilk, expenses, revenues } = req.body;
   const incomingExpenses = normalizeAmounts(expenses);
   const incomingRevenues = normalizeAmounts(revenues);
+  const tenantScope = getRequestTenantScope(req);
 
   try {
-    const oldEntry = await Submission.findOne({ date: decodedDate });
+    const oldEntry = await Submission.findOne(addTenantScope({ date: decodedDate }, tenantScope));
     if (!oldEntry) {
       return sendError(res, "Record not found", 404);
     }
@@ -644,7 +809,7 @@ async function updateRecordHandler(req, res, decodedDate) {
     const totals = calculateRecordTotals(morningMilk, eveningMilk, currentMilkPrice, expensesArray, revenuesArray);
 
     const updatedEntry = await Submission.findOneAndUpdate(
-      { date: decodedDate },
+      addTenantScope({ date: decodedDate }, tenantScope),
       {
         morningMilkQuantity: morningMilk,
         eveningMilkQuantity: eveningMilk,
@@ -658,10 +823,10 @@ async function updateRecordHandler(req, res, decodedDate) {
       { new: true }
     );
 
-    markMonthlyReportsDirty(monthKeyFromPkrDateString(decodedDate));
-    await ensureMonthlyReportsUpToDate();
+    markMonthlyReportsDirty(monthKeyFromPkrDateString(decodedDate), tenantScope);
+    await ensureMonthlyReportsUpToDate(tenantScope);
 
-    return sendSuccess(res, { date: decodedDate, updatedEntry }, "Record updated");
+    return sendSuccess(res, { date: decodedDate, updatedEntry, tenant: { code: tenantScope.tenantCode } }, "Record updated");
   } catch (err) {
     console.log(err);
     return sendError(res, "Something went wrong while updating record", 500);
@@ -717,13 +882,13 @@ app.get("/api/health", (req, res) => {
 
 app.get(["/", "/home"], requireAuth, async (req, res) => {
   try {
-    const entry = await Submission.findOne({ date: curdate() });
+    const tenantScope = getRequestTenantScope(req);
+    const entry = await Submission.findOne(addTenantScope({ date: curdate() }, tenantScope));
     return sendSuccess(res, {
-      user: {
-        id: req.user._id,
-        name: req.user.name,
-        email: req.user.email,
-        role: req.user.role,
+      user: userPayload(req.user),
+      tenant: {
+        id: tenantScope.tenantId,
+        code: tenantScope.tenantCode,
       },
       today: curdate(),
       todayEntryExists: Boolean(entry),
@@ -742,14 +907,75 @@ app.get("/login", (req, res) => {
 });
 
 app.post(["/api/auth/login", "/login"], async (req, res) => {
-  const { email, password } = req.body;
-  const user = await verifyUser(email, password);
+  const { email, password, tenantIdentifier, tenantPrefix, tenantCodeNumber } = req.body;
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const superadminUser = await User.findOne({
+    email: normalizedEmail,
+    password,
+    role: "superadmin",
+  });
+
+  if (superadminUser) {
+    const token = setUser({
+      ...superadminUser.toObject(),
+      tenantId: null,
+      tenantCode: null,
+      tenantName: null,
+    });
+    const oneMonth = 30 * 24 * 60 * 60 * 1000;
+    const isProd = process.env.NODE_ENV === "production";
+
+    res.cookie("tId", token, {
+      expires: new Date(Date.now() + oneMonth),
+      httpOnly: true,
+      sameSite: isProd ? "none" : "lax",
+      secure: isProd,
+    });
+
+    return sendSuccess(res, {
+      user: {
+        ...userPayload({
+          ...superadminUser.toObject(),
+          tenantId: null,
+          tenantCode: null,
+          tenantName: null,
+        }),
+      },
+    }, "Login successful");
+  }
+
+  const normalizedTenantCode = normalizeTenantIdentifierInput(tenantIdentifier, tenantPrefix, tenantCodeNumber);
+  if (!normalizedTenantCode) {
+    return sendError(res, "Tenant identifier is required for admin login", 400, {
+      requiredFormat: "Select ALPHA/BETA/CHARLIE/DELTA and code 001..999",
+    });
+  }
+
+  const tenant = await Tenant.findOne({ code: normalizedTenantCode });
+  const tenantStatus = getTenantStatus(tenant);
+
+  if (!tenant || !tenantStatus.isActiveNow) {
+    return sendError(res, "Tenant is invalid or inactive", 401);
+  }
+
+  if (tenantStatus.shouldReactivate) {
+    tenant.isActive = true;
+    tenant.inactiveUntil = null;
+    await tenant.save();
+  }
+
+  const user = await verifyUser(normalizedEmail, password, tenant);
 
   if (!user) {
     return sendError(res, "Invalid credentials", 401);
   }
 
-  const token = setUser(user);
+  const token = setUser({
+    ...user.toObject(),
+    tenantId: tenant._id,
+    tenantCode: tenant.code,
+    tenantName: tenant.name,
+  });
   const oneMonth = 30 * 24 * 60 * 60 * 1000;
   const isProd = process.env.NODE_ENV === "production";
 
@@ -762,22 +988,19 @@ app.post(["/api/auth/login", "/login"], async (req, res) => {
 
   return sendSuccess(res, {
     user: {
-      id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
+      ...userPayload({
+        ...user.toObject(),
+        tenantId: tenant._id,
+        tenantCode: tenant.code,
+        tenantName: tenant.name,
+      }),
     },
   }, "Login successful");
 });
 
 app.get("/api/auth/me", requireAuth, (req, res) => {
   return sendSuccess(res, {
-    user: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      role: req.user.role,
-    },
+    user: userPayload(req.user),
   }, "Authenticated user fetched");
 });
 
@@ -793,7 +1016,8 @@ app.get("/logout", (req, res) => {
 
 app.get("/api/hr/overview", requireAdmin, async (req, res) => {
   try {
-    const employees = await HrEmployee.find({}).sort({ createdAt: -1 });
+    const tenantScope = getRequestTenantScope(req);
+    const employees = await HrEmployee.find(addTenantScope({}, tenantScope)).sort({ createdAt: -1 });
     const activeEmployees = employees.filter((employee) => (employee.employmentStatus || "active") !== "left");
     const leftEmployees = employees.filter((employee) => (employee.employmentStatus || "active") === "left");
     const employeeSummaries = activeEmployees.map((employee) => formatEmployeeSummary(employee));
@@ -823,6 +1047,7 @@ app.get("/api/hr/overview", requireAdmin, async (req, res) => {
 
 app.post("/api/hr/employees", requireAdmin, async (req, res) => {
   try {
+    const tenantScope = getRequestTenantScope(req);
     const name = String(req.body.name || "").trim();
     const monthlyPay = Number(req.body.monthlyPay || 0);
     const joiningDate = parseDateToPKR(req.body.joiningDate || curdate());
@@ -836,6 +1061,8 @@ app.post("/api/hr/employees", requireAdmin, async (req, res) => {
     }
 
     const employee = new HrEmployee({
+      tenantId: tenantScope.tenantId,
+      tenantCode: tenantScope.tenantCode,
       name,
       monthlyPay: roundMoney(monthlyPay),
       joiningDate,
@@ -856,7 +1083,8 @@ app.post("/api/hr/employees", requireAdmin, async (req, res) => {
 
 app.get("/api/hr/employees/:id", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -890,7 +1118,8 @@ app.get("/api/hr/employees/:id", requireAdmin, async (req, res) => {
 
 app.post("/api/hr/employees/:id/transactions", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -923,7 +1152,7 @@ app.post("/api/hr/employees/:id/transactions", requireAdmin, async (req, res) =>
     await employee.save();
     const createdTransaction = employee.transactions[employee.transactions.length - 1];
     await upsertHrTransactionIntoDailyRecord(employee, createdTransaction);
-    await ensureMonthlyReportsUpToDate();
+    await ensureMonthlyReportsUpToDate(tenantScope);
 
     return sendSuccess(res, {
       employee: formatEmployeeSummary(employee),
@@ -937,7 +1166,8 @@ app.post("/api/hr/employees/:id/transactions", requireAdmin, async (req, res) =>
 
 app.put("/api/hr/employees/:id/transactions/:transactionId", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -978,9 +1208,9 @@ app.put("/api/hr/employees/:id/transactions/:transactionId", requireAdmin, async
     transaction.transactionDate = transactionDate;
 
     await employee.save();
-    await removeHrTransactionFromDailyRecords(transaction._id, previousTransactionDate);
+    await removeHrTransactionFromDailyRecords(transaction._id, tenantScope, previousTransactionDate);
     await upsertHrTransactionIntoDailyRecord(employee, transaction);
-    await ensureMonthlyReportsUpToDate();
+    await ensureMonthlyReportsUpToDate(tenantScope);
 
     return sendSuccess(res, {
       employee: formatEmployeeSummary(employee),
@@ -994,7 +1224,8 @@ app.put("/api/hr/employees/:id/transactions/:transactionId", requireAdmin, async
 
 app.post("/api/hr/employees/:id/increase-pay", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -1037,7 +1268,8 @@ app.post("/api/hr/employees/:id/increase-pay", requireAdmin, async (req, res) =>
 
 app.post("/api/hr/employees/:id/settlement-preview", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -1076,7 +1308,8 @@ app.post("/api/hr/employees/:id/settlement-preview", requireAdmin, async (req, r
 
 app.post("/api/hr/employees/:id/settle", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -1159,7 +1392,8 @@ app.post("/api/hr/employees/:id/settle", requireAdmin, async (req, res) => {
 
 app.post("/api/hr/employees/:id/mark-left", requireAdmin, async (req, res) => {
   try {
-    const employee = await HrEmployee.findById(req.params.id);
+    const tenantScope = getRequestTenantScope(req);
+    const employee = await HrEmployee.findOne(addTenantScope({ _id: req.params.id }, tenantScope));
     if (!employee) {
       return sendError(res, "Employee not found", 404);
     }
@@ -1214,6 +1448,7 @@ app.post("/api/hr/employees/:id/mark-left", requireAdmin, async (req, res) => {
 
 app.get(["/api/records", "/view"], requireAuth, async (req, res) => {
   try {
+    const tenantScope = getRequestTenantScope(req);
     const today = new Date();
     let month = req.query.month ? parseInt(req.query.month, 10) : today.getMonth() + 1;
     let year = req.query.year ? parseInt(req.query.year, 10) : today.getFullYear();
@@ -1231,7 +1466,7 @@ app.get(["/api/records", "/view"], requireAuth, async (req, res) => {
     const formattedStartDate = formatDateToYMD(startDate);
     const formattedEndDate = formatDateToYMD(endDate);
 
-    const allRecords = await Submission.find({});
+    const allRecords = await Submission.find(addTenantScope({}, tenantScope));
     const entries = allRecords.filter((record) => {
       const [day, dbMonth, dbYear] = record.date.split("/");
       const recordDate = formatDateToYMD(new Date(dbYear, dbMonth - 1, day));
@@ -1265,6 +1500,9 @@ app.get(["/api/records", "/view"], requireAuth, async (req, res) => {
         name: req.user.name,
         role: req.user.role,
       },
+      tenant: {
+        code: tenantScope.tenantCode,
+      },
       date: curdate(),
     }, "Records fetched");
   } catch (err) {
@@ -1277,7 +1515,8 @@ app.get(["/api/records/:date", "/individualRec/:date", "/update/:date"], require
   const decodedDate = decodeURIComponent(req.params.date);
 
   try {
-    const entry = await Submission.findOne({ date: decodedDate });
+    const tenantScope = getRequestTenantScope(req);
+    const entry = await Submission.findOne(addTenantScope({ date: decodedDate }, tenantScope));
     if (!entry) {
       return sendError(res, "Record not found", 404);
     }
@@ -1290,6 +1529,9 @@ app.get(["/api/records/:date", "/individualRec/:date", "/update/:date"], require
         name: req.user.name,
         role: req.user.role,
       },
+      tenant: {
+        code: tenantScope.tenantCode,
+      },
     }, "Record fetched");
   } catch (err) {
     console.log(err);
@@ -1298,6 +1540,7 @@ app.get(["/api/records/:date", "/individualRec/:date", "/update/:date"], require
 });
 
 app.post(["/api/records", "/submit"], requireAdmin, async (req, res) => {
+  const tenantScope = getRequestTenantScope(req);
   const morningMilk = req.body.morningMilk;
   const eveningMilk = req.body.eveningMilk;
   const expensesArray = normalizeAmounts(req.body.expenses);
@@ -1306,7 +1549,7 @@ app.post(["/api/records", "/submit"], requireAdmin, async (req, res) => {
   const selectedDate = req.body.recordDate;
   const currentDate = selectedDate || curdate();
 
-  const existingSubmission = await Submission.findOne({ date: currentDate });
+  const existingSubmission = await Submission.findOne(addTenantScope({ date: currentDate }, tenantScope));
   if (existingSubmission) {
     const existingExpenses = existingSubmission.expenses || [];
     const existingRevenues = existingSubmission.revenues || [];
@@ -1330,6 +1573,8 @@ app.post(["/api/records", "/submit"], requireAdmin, async (req, res) => {
   const totals = calculateRecordTotals(morningMilk, eveningMilk, currentMilkPrice, mergedExpenses, mergedRevenues);
 
   const submissionPayload = {
+    tenantId: tenantScope.tenantId,
+    tenantCode: tenantScope.tenantCode,
     date: currentDate,
     morningMilkQuantity: Number(morningMilk || 0),
     eveningMilkQuantity: Number(eveningMilk || 0),
@@ -1344,14 +1589,14 @@ app.post(["/api/records", "/submit"], requireAdmin, async (req, res) => {
   try {
     let savedSubmission;
     if (existingSubmission) {
-      savedSubmission = await Submission.findOneAndUpdate({ date: currentDate }, submissionPayload, { new: true });
+      savedSubmission = await Submission.findOneAndUpdate(addTenantScope({ date: currentDate }, tenantScope), submissionPayload, { new: true });
     } else {
       const newSubmission = new Submission(submissionPayload);
       savedSubmission = await newSubmission.save();
     }
 
-    markMonthlyReportsDirty(monthKeyFromPkrDateString(currentDate));
-    await ensureMonthlyReportsUpToDate();
+    markMonthlyReportsDirty(monthKeyFromPkrDateString(currentDate), tenantScope);
+    await ensureMonthlyReportsUpToDate(tenantScope);
 
     return sendSuccess(res, {
       date: currentDate,
@@ -1364,6 +1609,7 @@ app.post(["/api/records", "/submit"], requireAdmin, async (req, res) => {
 });
 
 app.post(["/api/records/check-new-date", "/update/new/check-date"], requireAdmin, async (req, res) => {
+  const tenantScope = getRequestTenantScope(req);
   const rawDate = req.body.date;
   const selectedDate = formatDateToPKR(rawDate);
   const { minDate, maxDate } = getCurrentMonthInputRange();
@@ -1383,7 +1629,7 @@ app.post(["/api/records/check-new-date", "/update/new/check-date"], requireAdmin
   }
 
   try {
-    const existingSubmission = await Submission.findOne({ date: selectedDate });
+    const existingSubmission = await Submission.findOne(addTenantScope({ date: selectedDate }, tenantScope));
     if (existingSubmission) {
       return sendError(res, `A record already exists for date ${selectedDate}`, 409);
     }
@@ -1401,11 +1647,12 @@ app.post(["/api/records/check-new-date", "/update/new/check-date"], requireAdmin
 });
 
 app.post(["/api/records/resolve-date", "/datetoUpdate"], requireAdmin, async (req, res) => {
+  const tenantScope = getRequestTenantScope(req);
   const date = req.body.date;
   const formattedDate = formatDateToPKR(date);
 
   try {
-    const entry = await Submission.findOne({ date: formattedDate });
+    const entry = await Submission.findOne(addTenantScope({ date: formattedDate }, tenantScope));
     if (!entry) {
       return sendError(res, "No entry exists for the given date", 404);
     }
@@ -1432,8 +1679,9 @@ app.post("/update/:date", requireAdmin, async (req, res) => {
 
 app.get(["/api/reports/months", "/getmonths"], requireAuth, async (req, res) => {
   try {
-    await ensureMonthlyReportsUpToDate();
-    const months = await MonthlyReport.find();
+    const tenantScope = getRequestTenantScope(req);
+    await ensureMonthlyReportsUpToDate(tenantScope);
+    const months = await MonthlyReport.find(addTenantScope({}, tenantScope));
     const formattedMonths = months.map((month) => formatMonth(month.month));
 
     return sendSuccess(res, {
@@ -1442,6 +1690,9 @@ app.get(["/api/reports/months", "/getmonths"], requireAuth, async (req, res) => 
       user: {
         name: req.user.name,
         role: req.user.role,
+      },
+      tenant: {
+        code: tenantScope.tenantCode,
       },
       date: curdate(),
     }, "Month list fetched");
@@ -1467,15 +1718,16 @@ app.get(["/api/reports/:month", "/getrep/:month"], requireAuth, async (req, res)
   const formattedEndDate = formatDateToYMD(endDate);
 
   try {
-    await ensureMonthlyReportsUpToDate();
-    const records = await Submission.find({});
+    const tenantScope = getRequestTenantScope(req);
+    await ensureMonthlyReportsUpToDate(tenantScope);
+    const records = await Submission.find(addTenantScope({}, tenantScope));
     const filteredRecords = records.filter((record) => {
       const [day, dbMonth, dbYear] = record.date.split("/");
       const recordDate = `${dbYear}-${String(dbMonth).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
       return recordDate >= formattedStartDate && recordDate <= formattedEndDate;
     });
 
-    const monthlyRecord = await MonthlyReport.findOne({ month: formattedMonth });
+    const monthlyRecord = await MonthlyReport.findOne(addTenantScope({ month: formattedMonth }, tenantScope));
 
     return sendSuccess(res, {
       month,
@@ -1485,6 +1737,9 @@ app.get(["/api/reports/:month", "/getrep/:month"], requireAuth, async (req, res)
       user: {
         name: req.user.name,
         role: req.user.role,
+      },
+      tenant: {
+        code: tenantScope.tenantCode,
       },
       date: new Date().toLocaleDateString(),
     }, "Monthly report fetched");
@@ -1500,6 +1755,249 @@ app.get(["/update", "/update/existing", "/update/new"], requireAdmin, (req, res)
     message: "Use /api/records and /api/records/check-new-date endpoints",
     range: getCurrentMonthInputRange(),
   }, "Legacy route kept for compatibility");
+});
+
+app.get("/api/superadmin/farms", requireSuperadmin, async (req, res) => {
+  try {
+    const tenants = await Tenant.find({}).sort({ createdAt: -1 });
+
+    const farms = [];
+    for (const tenant of tenants) {
+      const status = getTenantStatus(tenant);
+
+      if (status.shouldReactivate) {
+        tenant.isActive = true;
+        tenant.inactiveUntil = null;
+        await tenant.save();
+      }
+
+      farms.push({
+        id: tenant._id,
+        name: tenant.name,
+        code: tenant.code,
+        isActive: Boolean(tenant.isActive),
+        isActiveNow: Boolean(status.isActiveNow),
+        inactiveUntil: tenant.inactiveUntil,
+        createdAt: tenant.createdAt,
+        updatedAt: tenant.updatedAt,
+      });
+    }
+
+    return sendSuccess(res, { farms }, "Farm tenants fetched");
+  } catch (err) {
+    console.error("Error fetching farm tenants:", err);
+    return sendError(res, "Unable to fetch farm tenants", 500);
+  }
+});
+
+app.post("/api/superadmin/farms", requireSuperadmin, async (req, res) => {
+  const name = String(req.body.name || "").trim();
+  const code = normalizeTenantCode(req.body.code);
+  const email = String(req.body.email || "").trim().toLowerCase();
+  const password = String(req.body.password || "");
+
+  if (!name || !code || !email || !password) {
+    return sendError(res, "Farm name, tenant code, admin email, and password are required", 400);
+  }
+
+  try {
+    const existingTenant = await Tenant.findOne({ code }).lean();
+    if (existingTenant) {
+      return sendError(res, "Tenant code already exists", 409);
+    }
+
+    const tenant = await Tenant.create({
+      name,
+      code,
+      isActive: true,
+    });
+
+    try {
+      await User.create({
+        name: `${name} Admin`,
+        email,
+        password,
+        role: "admin",
+        tenantId: tenant._id,
+        tenantCode: tenant.code,
+      });
+    } catch (userErr) {
+      await Tenant.deleteOne({ _id: tenant._id });
+
+      if (userErr && typeof userErr === "object" && userErr.code === 11000) {
+        return sendError(res, "Admin user already exists for this tenant", 409);
+      }
+
+      throw userErr;
+    }
+
+    return sendSuccess(res, {
+      farm: {
+        id: tenant._id,
+        name: tenant.name,
+        code: tenant.code,
+        isActive: Boolean(tenant.isActive),
+        createdAt: tenant.createdAt,
+        updatedAt: tenant.updatedAt,
+      },
+    }, "Farm tenant created", 201);
+  } catch (err) {
+    console.error("Error creating farm tenant:", err);
+    return sendError(res, "Unable to create farm tenant", 500);
+  }
+});
+
+app.patch("/api/superadmin/farms/:id/status", requireSuperadmin, async (req, res) => {
+  const isActive = Boolean(req.body.isActive);
+  const inactiveUntilInput = req.body.inactiveUntil ? new Date(req.body.inactiveUntil) : null;
+  const inactiveUntil = inactiveUntilInput && !Number.isNaN(inactiveUntilInput.getTime()) ? inactiveUntilInput : null;
+
+  try {
+    const tenant = await Tenant.findByIdAndUpdate(
+      req.params.id,
+      {
+        isActive,
+        inactiveUntil: isActive ? null : inactiveUntil,
+      },
+      { new: true },
+    );
+
+    if (!tenant) {
+      return sendError(res, "Farm tenant not found", 404);
+    }
+
+    return sendSuccess(res, {
+      farm: {
+        id: tenant._id,
+        name: tenant.name,
+        code: tenant.code,
+        isActive: Boolean(tenant.isActive),
+        isActiveNow: Boolean(getTenantStatus(tenant).isActiveNow),
+        inactiveUntil: tenant.inactiveUntil,
+        createdAt: tenant.createdAt,
+        updatedAt: tenant.updatedAt,
+      },
+    }, "Farm tenant status updated");
+  } catch (err) {
+    console.error("Error updating farm tenant status:", err);
+    return sendError(res, "Unable to update farm tenant status", 500);
+  }
+});
+
+app.delete("/api/superadmin/farms/:id", requireSuperadmin, async (req, res) => {
+  try {
+    const tenant = await Tenant.findById(req.params.id);
+    if (!tenant) {
+      return sendError(res, "Farm tenant not found", 404);
+    }
+
+    await Promise.all([
+      User.deleteMany({ tenantId: tenant._id, tenantCode: tenant.code }),
+      HrEmployee.deleteMany({ tenantId: tenant._id, tenantCode: tenant.code }),
+      Submission.deleteMany({ tenantId: tenant._id, tenantCode: tenant.code }),
+      MonthlyReport.deleteMany({ tenantId: tenant._id, tenantCode: tenant.code }),
+      Tenant.deleteOne({ _id: tenant._id }),
+    ]);
+
+    return sendSuccess(res, null, "Farm tenant deleted");
+  } catch (err) {
+    console.error("Error deleting farm tenant:", err);
+    return sendError(res, "Unable to delete farm tenant", 500);
+  }
+});
+
+app.get("/api/superadmin/report", requireSuperadmin, async (req, res) => {
+  try {
+    const [
+      tenants,
+      totalUsers,
+      totalAdmins,
+      totalSuperadmins,
+      totalSubmissions,
+      totalHrEmployees,
+      totalMonthlyReports,
+    ] = await Promise.all([
+      Tenant.find({}).lean(),
+      User.countDocuments({}),
+      User.countDocuments({ role: "admin" }),
+      User.countDocuments({ role: "superadmin" }),
+      Submission.countDocuments({}),
+      HrEmployee.countDocuments({}),
+      MonthlyReport.countDocuments({}),
+    ]);
+
+    const activeFarms = tenants.filter((tenant) => getTenantStatus(tenant).isActiveNow).length;
+
+    return sendSuccess(res, {
+      totalFarms: tenants.length,
+      activeFarms,
+      inactiveFarms: tenants.length - activeFarms,
+      totalUsers,
+      totalAdmins,
+      totalSuperadmins,
+      totalUserLogs: totalUsers,
+      totalSubmissions,
+      totalHrEmployees,
+      totalMonthlyReports,
+    }, "Superadmin report fetched");
+  } catch (err) {
+    console.error("Error fetching superadmin report:", err);
+    return sendError(res, "Unable to fetch superadmin report", 500);
+  }
+});
+
+app.get("/api/superadmin/farms/:code/overview", requireSuperadmin, async (req, res) => {
+  const tenantCode = normalizeTenantCode(req.params.code);
+  if (!tenantCode) {
+    return sendError(res, "Invalid tenant code", 400);
+  }
+
+  try {
+    const tenant = await Tenant.findOne({ code: tenantCode }).lean();
+    if (!tenant) {
+      return sendError(res, "Tenant not found", 404);
+    }
+
+    const tenantScope = {
+      tenantId: tenant._id,
+      tenantCode: tenant.code,
+    };
+
+    const [
+      usersCount,
+      recordsCount,
+      hrEmployeesCount,
+      monthlyReportsCount,
+      latestRecords,
+    ] = await Promise.all([
+      User.countDocuments({ tenantId: tenant._id, tenantCode: tenant.code }),
+      Submission.countDocuments(addTenantScope({}, tenantScope)),
+      HrEmployee.countDocuments(addTenantScope({}, tenantScope)),
+      MonthlyReport.countDocuments(addTenantScope({}, tenantScope)),
+      Submission.find(addTenantScope({}, tenantScope)).sort({ createdAt: -1 }).limit(10).lean(),
+    ]);
+
+    return sendSuccess(res, {
+      farm: {
+        id: tenant._id,
+        name: tenant.name,
+        code: tenant.code,
+        isActive: tenant.isActive,
+        isActiveNow: getTenantStatus(tenant).isActiveNow,
+        inactiveUntil: tenant.inactiveUntil,
+      },
+      totals: {
+        usersCount,
+        recordsCount,
+        hrEmployeesCount,
+        monthlyReportsCount,
+      },
+      latestRecords,
+    }, "Farm overview fetched");
+  } catch (err) {
+    console.error("Error fetching farm overview:", err);
+    return sendError(res, "Unable to fetch farm overview", 500);
+  }
 });
 
 app.get("/contact", requireAuth, (req, res) => {

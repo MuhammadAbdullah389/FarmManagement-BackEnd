@@ -105,6 +105,17 @@ const salaryAdjustmentSchema = new mongoose.Schema(
 
 const hrEmployeeSchema = new mongoose.Schema(
   {
+    tenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true,
+      index: true,
+    },
+    tenantCode: {
+      type: String,
+      required: true,
+      uppercase: true,
+      trim: true,
+    },
     name: {
       type: String,
       required: true,
@@ -156,6 +167,8 @@ const hrEmployeeSchema = new mongoose.Schema(
     timestamps: true,
   },
 );
+
+hrEmployeeSchema.index({ tenantId: 1, name: 1 });
 
 const HrEmployee = mongoose.model("HrEmployee", hrEmployeeSchema);
 
